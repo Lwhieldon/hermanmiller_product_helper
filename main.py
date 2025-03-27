@@ -5,6 +5,8 @@ from typing import Set
 
 import streamlit as st
 from streamlit_chat import message
+# from langchain.globals import set_debug 
+# set_debug(True)  -- Uncomment this line to enable debug mode in terminal
 
 from backend.core import run_llm
 
