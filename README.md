@@ -1,1 +1,1 @@
-# hermanmiller_product_helper
+# elsco-product-helper
