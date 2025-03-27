@@ -24,11 +24,11 @@ def download_pdf(url):
 
 def ingest_docs():
     INDEX_NAME = os.getenv("INDEX_NAME")
-    langchain_documents_base_urls = [
+    documents_base_urls = [
    "https://www.hermanmiller.com/content/dam/hermanmiller/documents/pricing/PB_CWB.pdf"
     ]
     
-    for url in langchain_documents_base_urls:
+    for url in documents_base_urls:
         print(f"Loading {url}")
         
         if url.endswith(".pdf"):
