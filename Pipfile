@@ -10,7 +10,6 @@ black = "*"
 tiktoken = "*"
 openai = "*"
 pinecone-client = "*"
-unstructured = "*"
 nltk = "*"
 fastapi = "*"
 jinja2 = "*"
@@ -24,6 +23,10 @@ pillow = "*"
 langchain-community = "*"
 pymupdf = "*"
 langchain-pinecone = "*"
+pdfminer = "*"
+"pdfminer.six" = "==20221105"
+pdf2image = "*"
+unstructured = {extras = ["local-inference"], version = "*"}
 
 [dev-packages]
 
