@@ -4,29 +4,25 @@ import os
 import tempfile
 import requests
 import re
-from itertools import groupby
+import base64
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from langchain_openai import OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from langchain_community.document_loaders import (
-    FireCrawlLoader, 
-    PyMuPDFLoader, 
+    FireCrawlLoader,
+    PyMuPDFLoader,
     UnstructuredPDFLoader
 )
 
-# Download necessary NLTK models
 nltk.download("punkt")
 nltk.download("averaged_perceptron_tagger")
 
-# Load environment variables
 load_dotenv()
 
-# Embeddings model
 embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
 
-# Download the PDF
 def download_pdf(url):
     response = requests.get(url)
     if response.status_code == 200:
@@ -37,7 +33,37 @@ def download_pdf(url):
         return file_path
     return None
 
-# Flatten nested metadata dicts
+def extract_product_name_top_of_page(text):
+    lines = text.strip().split("\n")
+    for line in lines[:5]:
+        if re.match(r"^[A-Z][a-z]+(?: [A-Z][a-z]+)*$", line.strip()) and len(line.strip()) > 3:
+            return line.strip()
+    return None
+
+def extract_product_code(text):
+    match = re.search(r"(FT\d{3}\.)", text)
+    return match.group(1) if match else None
+
+def is_price_block(text):
+    lines = text.splitlines()
+    price_line_count = 0
+    ft_code_count = 0
+
+    for line in lines:
+        if re.search(r"\$\d{2,}", line):
+            price_line_count += 1
+        if re.search(r"\bFT\d{3}\.", line):
+            ft_code_count += 1
+
+    return price_line_count >= 3 or ft_code_count >= 3
+
+def extract_all_prices(text):
+    return [p for p in re.findall(r"\$\d{2,}(?:,\d{3})*", text)]
+
+def extract_spec_steps(text):
+    steps = re.findall(r"Step \d+\.\s*(.*?)\n", text)
+    return steps if steps else None
+
 def flatten_dict(d, parent_key='', sep='_'):
     items = {}
     for k, v in d.items():
@@ -52,11 +78,10 @@ def flatten_dict(d, parent_key='', sep='_'):
             items[new_key] = str(v)
     return items
 
-# Clean metadata for indexing
 def clean_metadata(metadata):
-    return flatten_dict(metadata)
+    flat = flatten_dict(metadata)
+    return {k: v for k, v in flat.items() if v is not None}
 
-# Merge wrapped rows in tables for better semantic coherence
 def merge_wrapped_rows(text):
     lines = text.split("\n")
     merged_lines = []
@@ -67,28 +92,16 @@ def merge_wrapped_rows(text):
             merged_lines.append(line)
     return "\n".join(merged_lines)
 
-# Expanded heading pattern matcher
-SECTION_PATTERNS = [
-    r"Walls", r"Work Surfaces", r"Storage", r"Screens", r"Lighting",
-    r"Installation", r"Warranty", r"Connectors", r"Terms and Conditions"
-]
-
 def extract_section_heading(text):
+    SECTION_PATTERNS = [
+        r"Walls", r"Work Surfaces", r"Storage", r"Screens", r"Lighting",
+        r"Installation", r"Warranty", r"Connectors", r"Terms and Conditions"
+    ]
     for pattern in SECTION_PATTERNS:
         if re.search(pattern, text, re.IGNORECASE):
             return pattern
     return "General"
 
-# Extract part/product code like FT110.
-def extract_product_code(text):
-    match = re.search(r"(FT\d{3}\.)", text)
-    return match.group(1) if match else None
-
-# Identify if chunk contains price list blocks
-def is_price_block(text):
-    return re.search(r"FT\d{3}\.", text) and re.search(r"\$\d{2,}", text)
-
-# Group documents by pricing table structure
 def group_table_related_docs(docs):
     grouped_docs = []
     group = []
@@ -106,7 +119,12 @@ def group_table_related_docs(docs):
         grouped_docs.append(Document(page_content=text, metadata=group[0].metadata))
     return grouped_docs
 
-# Ingestion pipeline
+def encode_image_base64(image_path):
+    if not os.path.exists(image_path):
+        return None
+    with open(image_path, "rb") as img_file:
+        return base64.b64encode(img_file.read()).decode("utf-8")
+
 def ingest_docs():
     INDEX_NAME = os.getenv("INDEX_NAME")
     documents_base_urls = [
@@ -137,9 +155,8 @@ def ingest_docs():
                     }
                 )
                 pymupdf_loader = PyMuPDFLoader(pdf_path)
-
                 raw_documents = unstructured_loader.load() + pymupdf_loader.load()
-                print("Ingested raw PDF documents using both loaders.")
+                print("Ingested raw PDF documents using both loaders. Total length:", len(raw_documents))
             else:
                 print(f"Failed to download PDF: {url}")
                 continue
@@ -150,15 +167,31 @@ def ingest_docs():
         for doc in raw_documents:
             doc.page_content = merge_wrapped_rows(doc.page_content)
             doc.metadata = clean_metadata(doc.metadata)
-            doc.metadata.update({
+
+            enriched = {
                 "section": extract_section_heading(doc.page_content),
                 "product_code": extract_product_code(doc.page_content),
+                "product_name": extract_product_name_top_of_page(doc.page_content),
+                "price_table_present": is_price_block(doc.page_content),
+                "all_prices": extract_all_prices(doc.page_content),
+                "spec_steps": extract_spec_steps(doc.page_content),
                 "source": url,
                 "file_name": os.path.basename(url)
-            })
+            }
+
+            image_paths = doc.metadata.get("image_path", [])
+            if isinstance(image_paths, str):
+                image_paths = [image_paths]
+
+            base64_images = [encode_image_base64(img) for img in image_paths if encode_image_base64(img)]
+            if base64_images:
+                enriched["images"] = base64_images
+
+            doc.metadata.update({k: v for k, v in enriched.items() if v is not None})
+            print(doc.metadata)
 
         grouped_docs = group_table_related_docs(raw_documents)
-        print(f"Grouped {len(raw_documents)} documents into {len(grouped_docs)} groups.")
+        print(f"Total number of documents to process is {len(grouped_docs)}.")
 
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
@@ -167,7 +200,7 @@ def ingest_docs():
         )
         documents = text_splitter.split_documents(grouped_docs)
 
-        print(f"Going to add {len(documents)} document(s) to Pinecone Vector {INDEX_NAME}.")
+        print(f"Going to add {len(documents)} document(s) to Pinecone Vector Index {INDEX_NAME}")
 
         PineconeVectorStore.from_documents(
             documents,
@@ -176,6 +209,8 @@ def ingest_docs():
         )
 
         print(f"***Finished loading {url} to Pinecone vectorstore.***")
+
+
 
 if __name__ == "__main__":
     ingest_docs()

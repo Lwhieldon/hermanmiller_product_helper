@@ -66,12 +66,16 @@ if "chat_answers_history" not in st.session_state:
 # Chat UI
 col1, col2 = st.columns([2, 1])
 with col1:
-    prompt = st.text_input("Prompt", placeholder="Enter your message here...")
+    st.text_input("Prompt", key="user_prompt", placeholder="Enter your message here...")
+
 with col2:
     if st.button("Submit", key="submit"):
-        prompt = prompt or "Hello"  # Default fallback
+        prompt = st.session_state["user_prompt"] or "Hello"
+        st.session_state["submitted_prompt"] = prompt
 
-if prompt:
+# Run the LLM only if a new prompt was submitted
+if "submitted_prompt" in st.session_state:
+    prompt = st.session_state.pop("submitted_prompt")
     with st.spinner("Generating response..."):
         generated_response = run_llm(
             query=prompt, chat_history=st.session_state["chat_history"]
