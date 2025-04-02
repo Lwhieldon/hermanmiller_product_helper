@@ -1,5 +1,3 @@
-# ingestion.py (now supports OpenAI Function Agent for multi-hop reasoning)
-
 from dotenv import load_dotenv
 import nltk
 import os
@@ -176,7 +174,7 @@ Input Table:
             if json_text_match:
                 return json.loads(json_text_match.group(0))
         except json.JSONDecodeError:
-            pass  # Try again if retry attempts remain
+            pass
 
     return {
         "raw_table": text_block,
@@ -251,7 +249,7 @@ def ingest_docs():
 
             structured_prices = extract_all_prices(doc.page_content)
             if structured_prices:
-                table_txt = "\n".join([" | ".join(structured_prices["columns"])] + structured_prices["rows"])
+                table_txt = "\n".join([" | ".join(structured_prices["columns"])]+ structured_prices["rows"])
                 doc.page_content += f"\n\n[PRICE TABLE]\n{table_txt}"
                 structured_json = call_openai_to_structurize_table(table_txt)
                 doc.metadata["structured_price_json"] = structured_json
@@ -274,12 +272,15 @@ def ingest_docs():
                 "coordinates_system": "PixelSpace",
                 "element_id": generate_element_id(doc.page_content)
             }
-            doc.metadata.update({k: v for k, v in enriched.items() if v is not None})
+            doc.metadata.update(clean_metadata(enriched))
 
         grouped_docs = split_by_product_code(raw_documents)
         print(f"Total chunks: {len(grouped_docs)}")
 
         documents = [doc for doc in grouped_docs if len(doc.page_content.strip()) > 100]
+
+        for doc in documents:
+            doc.metadata = clean_metadata(doc.metadata)
 
         for d in documents[:3]:
             print(f"\n\n--- Preview Document ---\n{d.metadata}\n{d.page_content[:400]}\n---")
@@ -290,7 +291,6 @@ def ingest_docs():
             index_name=INDEX_NAME
         )
 
-        # 🔁 Agent: Multi-hop Reasoning Interface
         agent = initialize_reasoning_agent(documents)
         result = agent.run("What's the price of a 42\" wide, 53\" high FT110 frame?")
         print("\n--- Agent Answer ---\n", result)
