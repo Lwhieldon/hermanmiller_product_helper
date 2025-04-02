@@ -133,39 +133,56 @@ def split_by_product_code(docs):
 def generate_element_id(content):
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, content[:50]))
 
-def call_openai_to_structurize_table(text_block):
-    prompt = f"""
-You are a product catalog assistant. Extract all possible permutations of product configuration options from the following price table block. 
+def call_openai_to_structurize_table(text_block, max_retries=2):
+    def generate_prompt(table_text):
+        return f"""
+You are a product catalog assistant.
 
-Each permutation should be treated as a unique option and include all relevant dimensions and their associated price (e.g., height, width, depth, or any available attribute).
-Also include base options when available. Base options may include letter codes like A, N, J, R, X, F, which define different product configurations. Each option should be output as its own object in the options array.
+Extract all possible permutations of product configuration options from the following price table block. Each permutation should include all relevant attributes (e.g., height, width, depth, base option letter) and its price.
 
-Output a clean JSON structure that includes:
-- the product code (if available)
-- a list of all possible configuration options with their corresponding attributes, option code, and price
+**Instructions**:
+- Only output a single valid JSON object.
+- Do NOT add explanations, comments, or anything outside the JSON.
+- Format the output exactly like the example below.
+- The input table is between triple backticks.
 
 Example Output:
-{
+{{
   "product_code": "FT110",
   "options": [
-    {"height": "35", "width": "18", "option": "A", "price": 219},
-    {"height": "35", "width": "18", "option": "N", "price": 246},
-    {"height": "35", "width": "18", "option": "J", "price": 0},
-    {"height": "35", "width": "18", "option": "R", "price": 0},
-    {"height": "35", "width": "18", "option": "X", "price": 203},
-    {"height": "35", "width": "24", "option": "A", "price": 232},
-    {"height": "35", "width": "24", "option": "N", "price": 264}
+    {{"height": "35", "width": "18", "option": "A", "price": 219}},
+    {{"height": "35", "width": "18", "option": "N", "price": 246}},
+    {{"height": "35", "width": "18", "option": "J", "price": 0}},
+    {{"height": "35", "width": "18", "option": "R", "price": 0}},
+    {{"height": "35", "width": "18", "option": "X", "price": 203}},
+    {{"height": "35", "width": "24", "option": "A", "price": 232}},
+    {{"height": "35", "width": "24", "option": "N", "price": 264}}
   ]
-}
+}}
 
-Input:
-{text_block}
+Input Table:
+```{table_text}```
 """
-    response = chat.invoke(prompt)
-    try:
-        return json.loads(response.content)
-    except:
-        return {"raw_table": text_block, "error": "Could not parse JSON"}
+
+    last_response = None
+
+    for attempt in range(max_retries + 1):
+        prompt = generate_prompt(text_block)
+        response = chat.invoke(prompt)
+        last_response = response.content
+
+        try:
+            json_text_match = re.search(r'\{.*\}', response.content, re.DOTALL)
+            if json_text_match:
+                return json.loads(json_text_match.group(0))
+        except json.JSONDecodeError:
+            pass  # Try again if retry attempts remain
+
+    return {
+        "raw_table": text_block,
+        "error": f"Failed to parse JSON after {max_retries + 1} attempts",
+        "raw_response": last_response
+    }
 
 def initialize_reasoning_agent(documents):
     def query_table_tool(input):
