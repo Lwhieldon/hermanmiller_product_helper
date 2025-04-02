@@ -73,7 +73,6 @@ with col2:
         prompt = st.session_state["user_prompt"] or "Hello"
         st.session_state["submitted_prompt"] = prompt
 
-# Run the LLM only if a new prompt was submitted
 if "submitted_prompt" in st.session_state:
     prompt = st.session_state.pop("submitted_prompt")
     with st.spinner("Generating response..."):
@@ -93,7 +92,6 @@ if "submitted_prompt" in st.session_state:
         st.session_state["chat_history"].append(("human", prompt))
         st.session_state["chat_history"].append(("ai", generated_response["result"]))
 
-# Display chat history
 if st.session_state["chat_answers_history"]:
     for chat_data, user_query in reversed(list(zip(
         st.session_state["chat_answers_history"],
@@ -104,13 +102,11 @@ if st.session_state["chat_answers_history"]:
         with st.expander("Show sources and metadata"):
             for doc in chat_data["sources"]:
                 metadata = doc.get("metadata", {})
-                page = metadata.get("page_number", "N/A")
-                element_type = metadata.get("element_type", "Unknown")
+                page = metadata.get("page_number", "None")
                 source = metadata.get("source", "Unknown source")
-                st.markdown(f"**Page {page} — {element_type}** from {source}")
+                st.markdown(f"**Page {page}, From {source}")
                 content = doc.get("page_content", "")
                 st.code(content[:500] + "..." if len(content) > 500 else content)
 
-# Footer
 st.markdown("---")
 st.markdown("App Powered by LangChain and Streamlit")
