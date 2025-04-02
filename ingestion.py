@@ -227,7 +227,6 @@ def ingest_docs():
                 enriched["images"] = base64_images
 
             doc.metadata.update({k: v for k, v in enriched.items() if v is not None})
-            print(doc.metadata)
 
         grouped_docs = group_table_related_docs(raw_documents)
         print(f"Total number of documents to process is {len(grouped_docs)}.")
