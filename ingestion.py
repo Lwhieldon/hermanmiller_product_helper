@@ -23,15 +23,6 @@ load_dotenv()
 
 embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
 
-def download_pdf(url):
-    response = requests.get(url)
-    if response.status_code == 200:
-        temp_dir = tempfile.gettempdir()
-        file_path = os.path.join(temp_dir, os.path.basename(url))
-        with open(file_path, "wb") as f:
-            f.write(response.content)
-        return file_path
-    return None
 
 def extract_product_name_top_of_page(text):
     lines = text.strip().split("\n")
@@ -40,9 +31,11 @@ def extract_product_name_top_of_page(text):
             return line.strip()
     return None
 
+
 def extract_product_code(text):
     match = re.search(r"(FT\d{3}\.)", text)
     return match.group(1) if match else None
+
 
 def is_price_block(text):
     lines = text.splitlines()
@@ -57,12 +50,44 @@ def is_price_block(text):
 
     return price_line_count >= 3 or ft_code_count >= 3
 
+
 def extract_all_prices(text):
-    return [p for p in re.findall(r"\$\d{2,}(?:,\d{3})*", text)]
+    lines = text.splitlines()
+    structured_table = []
+    headers = []
+    capture = False
+    product_line_found = False
+    blank_line_count = 0
+
+    for line in lines:
+        if re.match(r"\s*[A-Z](?:\s+[A-Z])+", line):
+            headers = re.findall(r"[A-Z]+", line)
+            capture = True
+            continue
+
+        if capture:
+            if re.search(r"\bFT\d{3}\.", line):
+                product_line_found = True
+                structured_table.append(line.strip())
+                blank_line_count = 0
+            elif product_line_found and re.search(r"\$\d{2,}", line):
+                structured_table.append(line.strip())
+                blank_line_count = 0
+            elif product_line_found and line.strip() == "":
+                blank_line_count += 1
+                if blank_line_count > 1:
+                    break
+            elif product_line_found and not re.search(r"\$\d{2,}", line):
+                break
+
+    rows = [row for row in structured_table if row.strip() != ""]
+    return {"columns": headers, "rows": rows} if rows else None
+
 
 def extract_spec_steps(text):
     steps = re.findall(r"Step \d+\.\s*(.*?)\n", text)
     return steps if steps else None
+
 
 def flatten_dict(d, parent_key='', sep='_'):
     items = {}
@@ -78,9 +103,11 @@ def flatten_dict(d, parent_key='', sep='_'):
             items[new_key] = str(v)
     return items
 
+
 def clean_metadata(metadata):
     flat = flatten_dict(metadata)
     return {k: v for k, v in flat.items() if v is not None}
+
 
 def merge_wrapped_rows(text):
     lines = text.split("\n")
@@ -92,6 +119,7 @@ def merge_wrapped_rows(text):
             merged_lines.append(line)
     return "\n".join(merged_lines)
 
+
 def extract_section_heading(text):
     SECTION_PATTERNS = [
         r"Walls", r"Work Surfaces", r"Storage", r"Screens", r"Lighting",
@@ -101,6 +129,7 @@ def extract_section_heading(text):
         if re.search(pattern, text, re.IGNORECASE):
             return pattern
     return "General"
+
 
 def group_table_related_docs(docs):
     grouped_docs = []
@@ -119,11 +148,13 @@ def group_table_related_docs(docs):
         grouped_docs.append(Document(page_content=text, metadata=group[0].metadata))
     return grouped_docs
 
+
 def encode_image_base64(image_path):
     if not os.path.exists(image_path):
         return None
     with open(image_path, "rb") as img_file:
         return base64.b64encode(img_file.read()).decode("utf-8")
+
 
 def ingest_docs():
     INDEX_NAME = os.getenv("INDEX_NAME")
@@ -168,12 +199,20 @@ def ingest_docs():
             doc.page_content = merge_wrapped_rows(doc.page_content)
             doc.metadata = clean_metadata(doc.metadata)
 
+            structured_prices = extract_all_prices(doc.page_content)
+            if structured_prices:
+                pretty_table = (
+                    " | ".join(structured_prices["columns"]) + "\n" +
+                    "\n".join(structured_prices["rows"])
+                )
+                doc.page_content += f"\n\n[PRICE TABLE]\n{pretty_table}"
+
             enriched = {
                 "section": extract_section_heading(doc.page_content),
                 "product_code": extract_product_code(doc.page_content),
                 "product_name": extract_product_name_top_of_page(doc.page_content),
                 "price_table_present": is_price_block(doc.page_content),
-                "all_prices": extract_all_prices(doc.page_content),
+                "all_prices": structured_prices,
                 "spec_steps": extract_spec_steps(doc.page_content),
                 "source": url,
                 "file_name": os.path.basename(url)
@@ -210,6 +249,16 @@ def ingest_docs():
 
         print(f"***Finished loading {url} to Pinecone vectorstore.***")
 
+
+def download_pdf(url):
+    response = requests.get(url)
+    if response.status_code == 200:
+        temp_dir = tempfile.gettempdir()
+        file_path = os.path.join(temp_dir, os.path.basename(url))
+        with open(file_path, "wb") as f:
+            f.write(response.content)
+        return file_path
+    return None
 
 
 if __name__ == "__main__":
