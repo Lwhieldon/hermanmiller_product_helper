@@ -1,4 +1,4 @@
-# ingestion.py (updated to use PDFPlumberLoader from langchain_community)
+# ingestion.py (now supports OpenAI Function Agent for multi-hop reasoning)
 
 from dotenv import load_dotenv
 import nltk
@@ -14,6 +14,8 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_pinecone import PineconeVectorStore
+from langchain.agents import initialize_agent, Tool
+from langchain.agents.agent_types import AgentType
 from langchain_community.document_loaders import (
     FireCrawlLoader,
     PyMuPDFLoader,
@@ -153,6 +155,20 @@ Input:
     except:
         return {"raw_table": text_block, "error": "Could not parse JSON"}
 
+def initialize_reasoning_agent(documents):
+    def query_table_tool(input):
+        relevant = [doc.metadata.get("structured_price_json") for doc in documents if "structured_price_json" in doc.metadata]
+        return json.dumps(relevant, indent=2)
+
+    tools = [
+        Tool(
+            name="TableQuery",
+            func=query_table_tool,
+            description="Use this to answer questions about product prices and configurations."
+        )
+    ]
+    return initialize_agent(tools, chat, agent=AgentType.OPENAI_FUNCTIONS, verbose=True)
+
 def ingest_docs():
     INDEX_NAME = os.getenv("INDEX_NAME")
     documents_base_urls = [
@@ -189,7 +205,7 @@ def ingest_docs():
 
             structured_prices = extract_all_prices(doc.page_content)
             if structured_prices:
-                table_txt = "\n".join([" | ".join(structured_prices["columns"]) + structured_prices["rows"]])
+                table_txt = "\n".join([" | ".join(structured_prices["columns"])] + structured_prices["rows"])
                 doc.page_content += f"\n\n[PRICE TABLE]\n{table_txt}"
                 structured_json = call_openai_to_structurize_table(table_txt)
                 doc.metadata["structured_price_json"] = structured_json
@@ -227,6 +243,11 @@ def ingest_docs():
             embeddings,
             index_name=INDEX_NAME
         )
+
+        # 🔁 Agent: Multi-hop Reasoning Interface
+        agent = initialize_reasoning_agent(documents)
+        result = agent.run("What's the price of a 42\" wide, 53\" high FT110 frame?")
+        print("\n--- Agent Answer ---\n", result)
 
         print(f"***Finished loading {url} to Pinecone vectorstore.***")
 
