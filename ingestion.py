@@ -135,16 +135,28 @@ def generate_element_id(content):
 
 def call_openai_to_structurize_table(text_block):
     prompt = f"""
-You are a product catalog assistant. Extract the table data from the following price table block, and convert it into structured JSON.
+You are a product catalog assistant. Extract all possible permutations of product configuration options from the following price table block. 
+
+Each permutation should be treated as a unique option and include all relevant dimensions and their associated price (e.g., height, width, depth, or any available attribute).
+Also include base options when available. Base options may include letter codes like A, N, J, R, X, F, which define different product configurations. Each option should be output as its own object in the options array.
+
+Output a clean JSON structure that includes:
+- the product code (if available)
+- a list of all possible configuration options with their corresponding attributes, option code, and price
 
 Example Output:
-{{
+{
   "product_code": "FT110",
   "options": [
-    {{"height": "35", "width": "18", "price": 219}},
-    ...
+    {"height": "35", "width": "18", "option": "A", "price": 219},
+    {"height": "35", "width": "18", "option": "N", "price": 246},
+    {"height": "35", "width": "18", "option": "J", "price": 0},
+    {"height": "35", "width": "18", "option": "R", "price": 0},
+    {"height": "35", "width": "18", "option": "X", "price": 203},
+    {"height": "35", "width": "24", "option": "A", "price": 232},
+    {"height": "35", "width": "24", "option": "N", "price": 264}
   ]
-}}
+}
 
 Input:
 {text_block}
@@ -157,14 +169,31 @@ Input:
 
 def initialize_reasoning_agent(documents):
     def query_table_tool(input):
-        relevant = [doc.metadata.get("structured_price_json") for doc in documents if "structured_price_json" in doc.metadata]
-        return json.dumps(relevant, indent=2)
+        query = input.lower()
+        results = []
+        for doc in documents:
+            if "structured_price_json" in doc.metadata:
+                data = doc.metadata["structured_price_json"]
+                product_code = data.get("product_code", "")
+                options = data.get("options", [])
+                for opt in options:
+                    match_product = product_code.lower() in query if product_code else False
+                    match_option = str(opt.get("option", "")).lower() in query if "option" in opt else True
+                    match_height = str(opt.get("height", "")).lower() in query if "height" in opt else True
+                    match_width = str(opt.get("width", "")).lower() in query if "width" in opt else True
+                    if match_product and match_option and match_height and match_width:
+                        results.append(opt)
+
+        if "cheapest" in query and results:
+            results = sorted(results, key=lambda x: x.get("price", float('inf')))
+            return json.dumps(results[:1], indent=2)
+        return json.dumps(results, indent=2)
 
     tools = [
         Tool(
             name="TableQuery",
             func=query_table_tool,
-            description="Use this to answer questions about product prices and configurations."
+            description="Use this to answer questions about product prices and configurations, including filtering by base option."
         )
     ]
     return initialize_agent(tools, chat, agent=AgentType.OPENAI_FUNCTIONS, verbose=True)
