@@ -27,6 +27,7 @@ pdfminer = "*"
 "pdfminer.six" = "==20221105"
 pdf2image = "*"
 unstructured = {extras = ["local-inference"], version = "*"}
+pdfplumber = "*"
 
 [dev-packages]
 
