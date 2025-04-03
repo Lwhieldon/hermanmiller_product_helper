@@ -4,11 +4,9 @@ import os
 import tempfile
 import requests
 import re
-import base64
 import uuid
 import json
 
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_pinecone import PineconeVectorStore
@@ -39,8 +37,15 @@ def extract_product_name_top_of_page(text):
     return None
 
 def extract_product_code(text):
-    match = re.search(r"(FT\d{3}\.)", text)
-    return match.group(1) if match else None
+    match = re.search(r"\b(FT\d{3})\b[\.]?", text)
+    if match:
+        return match.group(1) + "."
+
+    step_match = re.search(r"Step\s+1\.[\s\n]+(FT\d{3})[\.]?", text)
+    if step_match:
+        return step_match.group(1) + "."
+
+    return None
 
 def is_price_block(text):
     lines = text.splitlines()
@@ -101,7 +106,13 @@ def merge_wrapped_rows(text):
     return "\n".join(merged_lines)
 
 def clean_metadata(metadata):
-    return {k: v for k, v in metadata.items() if v is not None}
+    clean = {}
+    for k, v in metadata.items():
+        if isinstance(v, (str, int, float, bool)):
+            clean[k] = v
+        elif isinstance(v, list) and all(isinstance(i, str) for i in v):
+            clean[k] = v
+    return clean
 
 def split_by_product_code(docs):
     grouped = []
@@ -149,12 +160,7 @@ Example Output:
   "product_code": "FT110",
   "options": [
     {{"height": "35", "width": "18", "option": "A", "price": 219}},
-    {{"height": "35", "width": "18", "option": "N", "price": 246}},
-    {{"height": "35", "width": "18", "option": "J", "price": 0}},
-    {{"height": "35", "width": "18", "option": "R", "price": 0}},
-    {{"height": "35", "width": "18", "option": "X", "price": 203}},
-    {{"height": "35", "width": "24", "option": "A", "price": 232}},
-    {{"height": "35", "width": "24", "option": "N", "price": 264}}
+    {{"height": "35", "width": "18", "option": "N", "price": 246}}
   ]
 }}
 
@@ -188,16 +194,19 @@ def initialize_reasoning_agent(documents):
         results = []
         for doc in documents:
             if "structured_price_json" in doc.metadata:
-                data = doc.metadata["structured_price_json"]
-                product_code = data.get("product_code", "")
-                options = data.get("options", [])
-                for opt in options:
-                    match_product = product_code.lower() in query if product_code else False
-                    match_option = str(opt.get("option", "")).lower() in query if "option" in opt else True
-                    match_height = str(opt.get("height", "")).lower() in query if "height" in opt else True
-                    match_width = str(opt.get("width", "")).lower() in query if "width" in opt else True
-                    if match_product and match_option and match_height and match_width:
-                        results.append(opt)
+                try:
+                    data = json.loads(doc.metadata["structured_price_json"])
+                    product_code = data.get("product_code", "")
+                    options = data.get("options", [])
+                    for opt in options:
+                        match_product = product_code.lower() in query if product_code else False
+                        match_option = str(opt.get("option", "")).lower() in query if "option" in opt else True
+                        match_height = str(opt.get("height", "")).lower() in query if "height" in opt else True
+                        match_width = str(opt.get("width", "")).lower() in query if "width" in opt else True
+                        if match_product and match_option and match_height and match_width:
+                            results.append(opt)
+                except Exception as e:
+                    print(f"[ERROR] Failed to parse structured_price_json for reasoning: {e}")
 
         if "cheapest" in query and results:
             results = sorted(results, key=lambda x: x.get("price", float('inf')))
@@ -214,6 +223,7 @@ def initialize_reasoning_agent(documents):
     return initialize_agent(tools, chat, agent=AgentType.OPENAI_FUNCTIONS, verbose=True)
 
 def ingest_docs():
+    page_product_log = []
     INDEX_NAME = os.getenv("INDEX_NAME")
     documents_base_urls = [
         "https://www.hermanmiller.com/content/dam/hermanmiller/documents/pricing/PB_CWB.pdf"
@@ -243,6 +253,8 @@ def ingest_docs():
             loader = FireCrawlLoader(url=url, mode="scrape")
             raw_documents = loader.load()
 
+        last_known_code = None
+
         for doc in raw_documents:
             doc.page_content = merge_wrapped_rows(doc.page_content)
             doc.metadata = clean_metadata(doc.metadata)
@@ -252,17 +264,22 @@ def ingest_docs():
                 table_txt = "\n".join([" | ".join(structured_prices["columns"])]+ structured_prices["rows"])
                 doc.page_content += f"\n\n[PRICE TABLE]\n{table_txt}"
                 structured_json = call_openai_to_structurize_table(table_txt)
-                doc.metadata["structured_price_json"] = structured_json
+            else:
+                structured_json = None
 
             page_number = doc.metadata.get("page")
             prod_code = extract_product_code(doc.page_content)
+            if not prod_code and last_known_code:
+                prod_code = last_known_code
+            elif prod_code:
+                last_known_code = prod_code
 
             enriched = {
                 "section": extract_section_heading(doc.page_content),
                 "product_code": prod_code,
                 "product_name": extract_product_name_top_of_page(doc.page_content),
                 "price_table_present": bool(structured_prices),
-                "all_prices": structured_prices,
+                "all_prices": json.dumps(structured_prices) if structured_prices else None,
                 "spec_steps": extract_spec_steps(doc.page_content),
                 "source": url,
                 "file_name": os.path.basename(url),
@@ -270,9 +287,17 @@ def ingest_docs():
                 "coordinates_layout_width": 1700,
                 "coordinates_layout_height": 2200,
                 "coordinates_system": "PixelSpace",
-                "element_id": generate_element_id(doc.page_content)
+                "element_id": generate_element_id(doc.page_content),
+                "structured_price_json": json.dumps(structured_json) if structured_json else None
             }
+
+            if not prod_code:
+                print(f"[WARNING] Missing product_code in file: {os.path.basename(url)}, page: {page_number}")
+            if not structured_prices:
+                print(f"[INFO] No structured prices found for page {page_number}")
+
             doc.metadata.update(clean_metadata(enriched))
+            page_product_log.append({"page": page_number, "product_code": prod_code})
 
         grouped_docs = split_by_product_code(raw_documents)
         print(f"Total chunks: {len(grouped_docs)}")
@@ -285,6 +310,11 @@ def ingest_docs():
         for d in documents[:3]:
             print(f"\n\n--- Preview Document ---\n{d.metadata}\n{d.page_content[:400]}\n---")
 
+        for doc in documents:
+            for k, v in doc.metadata.items():
+                if not isinstance(v, (str, int, float, bool, list)):
+                    print(f"[ERROR] Invalid metadata value for key '{k}': {type(v)}")
+
         PineconeVectorStore.from_documents(
             documents,
             embeddings,
@@ -294,6 +324,10 @@ def ingest_docs():
         agent = initialize_reasoning_agent(documents)
         result = agent.run("What's the price of a 42\" wide, 53\" high FT110 frame?")
         print("\n--- Agent Answer ---\n", result)
+
+        print("--- Page to Product Code Mapping ---")
+        for entry in page_product_log:
+            print(f"Page {entry['page']}: {entry['product_code']}")
 
         print(f"***Finished loading {url} to Pinecone vectorstore.***")
 
