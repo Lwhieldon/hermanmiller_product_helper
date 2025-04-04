@@ -1,346 +1,250 @@
-from dotenv import load_dotenv
-import nltk
 import os
 import tempfile
 import requests
+import logging
+from dotenv import load_dotenv
+from typing import List, Dict, Any
 import re
-import uuid
-import json
+from collections import defaultdict
 
 from langchain.schema import Document
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_openai import OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
-from langchain.agents import initialize_agent, Tool
-from langchain.agents.agent_types import AgentType
-from langchain_community.document_loaders import (
-    FireCrawlLoader,
-    PyMuPDFLoader,
-    UnstructuredPDFLoader,
-    PDFPlumberLoader
+from pdfminer.high_level import extract_pages
+from pdfminer.layout import (
+    LTTextContainer,
+    LTTextBoxHorizontal,
+    LTImage,
+    LTFigure,
+    LAParams,
 )
 
-nltk.download("punkt")
-nltk.download("averaged_perceptron_tagger")
+# Configure logging
+logging.basicConfig(
+    filename="ingestion.log",
+    filemode="w",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 
+# Load environment variables
 load_dotenv()
 
+# Initialize OpenAI embeddings
 embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-chat = ChatOpenAI(model="gpt-4", temperature=0)
+INDEX_NAME = os.getenv("INDEX_NAME")
 
-# --- Util Functions ---
 
-def extract_product_name_top_of_page(text):
-    lines = text.strip().split("\n")
-    for line in lines[:5]:
-        if re.match(r"^[A-Z][a-z]+(?: [A-Z][a-z]+)*$", line.strip()) and len(line.strip()) > 3:
-            return line.strip()
-    return None
+# --- Utility Functions ---
 
-def extract_product_code(text):
-    match = re.search(r"\b(FT\d{3})\b[\.]?", text)
-    if match:
-        return match.group(1) + "."
-
-    step_match = re.search(r"Step\s+1\.[\s\n]+(FT\d{3})[\.]?", text)
-    if step_match:
-        return step_match.group(1) + "."
-
-    return None
-
-def is_price_block(text):
-    lines = text.splitlines()
-    price_line_count = sum(1 for line in lines if re.search(r"\$\d{2,}", line))
-    ft_code_count = sum(1 for line in lines if re.search(r"\bFT\d{3}\.", line))
-    return price_line_count >= 3 or ft_code_count >= 3
-
-def extract_all_prices(text):
-    lines = text.splitlines()
-    structured_table = []
-    headers = []
-    capture = False
-    product_line_found = False
-    blank_line_count = 0
-
-    for line in lines:
-        if re.match(r"\s*[A-Z](?:\s+[A-Z])+", line):
-            headers = re.findall(r"[A-Z]+", line)
-            capture = True
-            continue
-
-        if capture:
-            if re.search(r"\bFT\d{3}\.", line):
-                product_line_found = True
-                structured_table.append(line.strip())
-                blank_line_count = 0
-            elif product_line_found and re.search(r"\$\d{2,}", line):
-                structured_table.append(line.strip())
-                blank_line_count = 0
-            elif product_line_found and line.strip() == "":
-                blank_line_count += 1
-                if blank_line_count > 1:
-                    break
-            elif product_line_found and not re.search(r"\$\d{2,}", line):
-                break
-
-    rows = [row for row in structured_table if row.strip() != ""]
-    return {"columns": headers, "rows": rows} if rows else None
-
-def extract_spec_steps(text):
-    return re.findall(r"Step \d+\.\s*(.*?)\n", text)
-
-def extract_section_heading(text):
-    patterns = ["Walls", "Work Surfaces", "Storage", "Screens", "Lighting"]
-    for pattern in patterns:
-        if re.search(pattern, text, re.IGNORECASE):
-            return pattern
-    return "General"
-
-def merge_wrapped_rows(text):
-    lines = text.split("\n")
-    merged_lines = []
-    for line in lines:
-        if merged_lines and line.startswith(" "):
-            merged_lines[-1] += " " + line.strip()
-        else:
-            merged_lines.append(line)
-    return "\n".join(merged_lines)
-
-def clean_metadata(metadata):
-    clean = {}
-    for k, v in metadata.items():
-        if isinstance(v, (str, int, float, bool)):
-            clean[k] = v
-        elif isinstance(v, list) and all(isinstance(i, str) for i in v):
-            clean[k] = v
-    return clean
-
-def split_by_product_code(docs):
-    grouped = []
-    current_chunk = []
-    current_code = None
-    for doc in docs:
-        lines = doc.page_content.splitlines()
-        for line in lines:
-            match = re.match(r"^(FT\d{3}\.)", line)
-            if match:
-                if current_chunk:
-                    grouped.append(Document(
-                        page_content="\n".join(current_chunk),
-                        metadata={**doc.metadata, "product_code": current_code}
-                    ))
-                    current_chunk = []
-                current_code = match.group(1)
-            current_chunk.append(line)
-        if current_chunk:
-            grouped.append(Document(
-                page_content="\n".join(current_chunk),
-                metadata={**doc.metadata, "product_code": current_code}
-            ))
-            current_chunk = []
-    return grouped
-
-def generate_element_id(content):
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, content[:50]))
-
-def call_openai_to_structurize_table(text_block, max_retries=2):
-    def generate_prompt(table_text):
-        return f"""
-You are a product catalog assistant.
-
-Extract all possible permutations of product configuration options from the following price table block. Each permutation should include all relevant attributes (e.g., height, width, depth, base option letter) and its price.
-
-**Instructions**:
-- Only output a single valid JSON object.
-- Do NOT add explanations, comments, or anything outside the JSON.
-- Format the output exactly like the example below.
-- The input table is between triple backticks.
-
-Example Output:
-{{
-  "product_code": "FT110",
-  "options": [
-    {{"height": "35", "width": "18", "option": "A", "price": 219}},
-    {{"height": "35", "width": "18", "option": "N", "price": 246}}
-  ]
-}}
-
-Input Table:
-```{table_text}```
-"""
-
-    last_response = None
-
-    for attempt in range(max_retries + 1):
-        prompt = generate_prompt(text_block)
-        response = chat.invoke(prompt)
-        last_response = response.content
-
-        try:
-            json_text_match = re.search(r'\{.*\}', response.content, re.DOTALL)
-            if json_text_match:
-                return json.loads(json_text_match.group(0))
-        except json.JSONDecodeError:
-            pass
-
-    return {
-        "raw_table": text_block,
-        "error": f"Failed to parse JSON after {max_retries + 1} attempts",
-        "raw_response": last_response
-    }
-
-def initialize_reasoning_agent(documents):
-    def query_table_tool(input):
-        query = input.lower()
-        results = []
-        for doc in documents:
-            if "structured_price_json" in doc.metadata:
-                try:
-                    data = json.loads(doc.metadata["structured_price_json"])
-                    product_code = data.get("product_code", "")
-                    options = data.get("options", [])
-                    for opt in options:
-                        match_product = product_code.lower() in query if product_code else False
-                        match_option = str(opt.get("option", "")).lower() in query if "option" in opt else True
-                        match_height = str(opt.get("height", "")).lower() in query if "height" in opt else True
-                        match_width = str(opt.get("width", "")).lower() in query if "width" in opt else True
-                        if match_product and match_option and match_height and match_width:
-                            results.append(opt)
-                except Exception as e:
-                    print(f"[ERROR] Failed to parse structured_price_json for reasoning: {e}")
-
-        if "cheapest" in query and results:
-            results = sorted(results, key=lambda x: x.get("price", float('inf')))
-            return json.dumps(results[:1], indent=2)
-        return json.dumps(results, indent=2)
-
-    tools = [
-        Tool(
-            name="TableQuery",
-            func=query_table_tool,
-            description="Use this to answer questions about product prices and configurations, including filtering by base option."
-        )
-    ]
-    return initialize_agent(tools, chat, agent=AgentType.OPENAI_FUNCTIONS, verbose=True)
-
-def ingest_docs():
-    page_product_log = []
-    INDEX_NAME = os.getenv("INDEX_NAME")
-    documents_base_urls = [
-        "https://www.hermanmiller.com/content/dam/hermanmiller/documents/pricing/PB_CWB.pdf"
-    ]
-
-    for url in documents_base_urls:
-        print(f"Loading {url}")
-        if url.endswith(".pdf"):
-            pdf_path = download_pdf(url)
-            if not pdf_path:
-                continue
-
-            pdfplumber_loader = PDFPlumberLoader(pdf_path)
-            pymupdf_loader = PyMuPDFLoader(pdf_path)
-            unstructured_loader = UnstructuredPDFLoader(
-                file_path=pdf_path,
-                mode="elements",
-                strategy="hi_res",
-                unstructured_kwargs={"detect_tables": True, "use_image": True, "include_metadata": True}
-            )
-            raw_documents = (
-                pdfplumber_loader.load()
-                + pymupdf_loader.load()
-                + unstructured_loader.load()
-            )
-        else:
-            loader = FireCrawlLoader(url=url, mode="scrape")
-            raw_documents = loader.load()
-
-        last_known_code = None
-
-        for doc in raw_documents:
-            doc.page_content = merge_wrapped_rows(doc.page_content)
-            doc.metadata = clean_metadata(doc.metadata)
-
-            structured_prices = extract_all_prices(doc.page_content)
-            if structured_prices:
-                table_txt = "\n".join([" | ".join(structured_prices["columns"])]+ structured_prices["rows"])
-                doc.page_content += f"\n\n[PRICE TABLE]\n{table_txt}"
-                structured_json = call_openai_to_structurize_table(table_txt)
-            else:
-                structured_json = None
-
-            page_number = doc.metadata.get("page")
-            prod_code = extract_product_code(doc.page_content)
-            if not prod_code and last_known_code:
-                prod_code = last_known_code
-            elif prod_code:
-                last_known_code = prod_code
-
-            enriched = {
-                "section": extract_section_heading(doc.page_content),
-                "product_code": prod_code,
-                "product_name": extract_product_name_top_of_page(doc.page_content),
-                "price_table_present": bool(structured_prices),
-                "all_prices": json.dumps(structured_prices) if structured_prices else None,
-                "spec_steps": extract_spec_steps(doc.page_content),
-                "source": url,
-                "file_name": os.path.basename(url),
-                "page_number": page_number,
-                "coordinates_layout_width": 1700,
-                "coordinates_layout_height": 2200,
-                "coordinates_system": "PixelSpace",
-                "element_id": generate_element_id(doc.page_content),
-                "structured_price_json": json.dumps(structured_json) if structured_json else None
-            }
-
-            if not prod_code:
-                print(f"[WARNING] Missing product_code in file: {os.path.basename(url)}, page: {page_number}")
-            if not structured_prices:
-                print(f"[INFO] No structured prices found for page {page_number}")
-
-            doc.metadata.update(clean_metadata(enriched))
-            page_product_log.append({"page": page_number, "product_code": prod_code})
-
-        grouped_docs = split_by_product_code(raw_documents)
-        print(f"Total chunks: {len(grouped_docs)}")
-
-        documents = [doc for doc in grouped_docs if len(doc.page_content.strip()) > 100]
-
-        for doc in documents:
-            doc.metadata = clean_metadata(doc.metadata)
-
-        for d in documents[:3]:
-            print(f"\n\n--- Preview Document ---\n{d.metadata}\n{d.page_content[:400]}\n---")
-
-        for doc in documents:
-            for k, v in doc.metadata.items():
-                if not isinstance(v, (str, int, float, bool, list)):
-                    print(f"[ERROR] Invalid metadata value for key '{k}': {type(v)}")
-
-        PineconeVectorStore.from_documents(
-            documents,
-            embeddings,
-            index_name=INDEX_NAME
-        )
-
-        agent = initialize_reasoning_agent(documents)
-        result = agent.run("What's the price of a 42\" wide, 53\" high FT110 frame?")
-        print("\n--- Agent Answer ---\n", result)
-
-        print("--- Page to Product Code Mapping ---")
-        for entry in page_product_log:
-            print(f"Page {entry['page']}: {entry['product_code']}")
-
-        print(f"***Finished loading {url} to Pinecone vectorstore.***")
-
-def download_pdf(url):
+def download_pdf(url: str) -> str | None:
     response = requests.get(url)
     if response.status_code == 200:
         temp_dir = tempfile.gettempdir()
         file_path = os.path.join(temp_dir, os.path.basename(url))
         with open(file_path, "wb") as f:
             f.write(response.content)
+        logging.info(f"Downloaded PDF to {file_path}")
         return file_path
+    logging.warning(
+        f"Failed to download PDF from {url} (status code: {response.status_code})"
+    )
     return None
+
+
+def clean_metadata(metadata: dict) -> dict:
+    return {k: v for k, v in metadata.items() if isinstance(v, (str, int, float, bool))}
+
+
+def merge_wrapped_lines(text: str) -> str:
+    lines = text.split("\n")
+    merged = []
+    for line in lines:
+        if merged and line.startswith(" "):
+            merged[-1] += " " + line.strip()
+        else:
+            merged.append(line)
+    return "\n".join(merged)
+
+
+def is_price(text: str) -> bool:
+    """Very basic check if a string looks like a price."""
+    return bool(re.match(r"^\$\d+\.?\d{0,2}$", text.strip()))
+
+
+def chunk_intelligently(elements: List[dict], global_metadata: dict) -> List[Document]:
+    MAX_CHUNK_LENGTH = 400  # Reduced chunk size
+    MIN_CHUNK_LENGTH = 50
+    chunks: List[Document] = []
+    current_chunk_text = ""
+    current_chunk_metadata = global_metadata.copy()
+
+    def finish_chunk():
+        nonlocal current_chunk_text, current_chunk_metadata  # Declare nonlocal
+        if (
+            current_chunk_text and len(current_chunk_text) > MIN_CHUNK_LENGTH
+        ):  # Only add if it's long enough
+            chunks.append(
+                Document(
+                    page_content=current_chunk_text.strip(),
+                    metadata=current_chunk_metadata.copy(),  # Copy metadata for the chunk
+                )
+            )
+        current_chunk_text = ""
+        current_chunk_metadata = global_metadata.copy()  # Reset metadata to global_metadata
+
+    for element in elements:
+        text = element["text"]
+        if not text:
+            continue  # Skip empty elements
+
+        if element["type"] == "heading":
+            finish_chunk()
+            current_chunk_metadata["heading"] = text
+            current_chunk_text = text
+        elif len(current_chunk_text) + len(text) + 1 <= MAX_CHUNK_LENGTH:  # Keep chunks smaller
+            current_chunk_text += " " + text
+        else:
+            finish_chunk()
+            current_chunk_text = text
+
+    finish_chunk()  # Finish the last chunk
+    return chunks
+
+
+def extract_elements(pdf_path: str) -> List[dict]:
+    """
+    Extracts structured information from the PDF, handling columns and tables.
+    """
+
+    elements: List[Dict[str, Any]] = []
+    try:
+        laparams = LAParams(
+            line_overlap=0.5,
+            char_margin=2.0,
+            line_margin=0.5,
+            word_margin=0.1,
+            boxes_flow=0.5,
+            all_texts=False,
+            detect_vertical=False,
+        )
+
+        pages = list(extract_pages(pdf_path, laparams=laparams))
+        for page_num, page_layout in enumerate(pages):
+            vertical_groups = defaultdict(list)
+            for element in page_layout:
+                y0 = round(element.y0, 2)
+                vertical_groups[y0].append(element)
+
+            for group in vertical_groups.values():
+                group.sort(key=lambda x: x.x0)
+
+            for group in vertical_groups.values():
+                for element in group:
+                    if isinstance(element, LTTextContainer):
+                        text = merge_wrapped_lines(element.get_text()).strip()
+                        if not text:
+                            continue
+
+                        if element.height > 12:
+                            elements.append({"type": "heading", "text": text, "page": page_num + 1})
+                        elif is_price(text):
+                            elements.append({"type": "price", "text": text, "page": page_num + 1})
+                        else:
+                            elements.append({"type": "text", "text": text, "page": page_num + 1})
+                    elif isinstance(element, LTImage):
+                        elements.append({"type": "image", "text": "Image", "page": page_num + 1})
+                    elif isinstance(element, LTFigure):
+                        elements.append({"type": "figure", "text": "Figure", "page": page_num + 1})
+
+    except Exception as e:
+        logging.error(f"Error extracting elements from {pdf_path}: {e}")
+    return elements
+
+
+def process_pdf(pdf_path: str) -> List[Document]:
+    """
+    Processes a single PDF to extract, chunk, and prepare documents.
+    """
+
+    raw_metadata = {"source": pdf_path}
+    chunks: List[Document] = []
+
+    try:
+        extracted_elements = extract_elements(pdf_path)
+        chunks = chunk_intelligently(extracted_elements, raw_metadata)
+
+        for i, chunk in enumerate(chunks):  # Add prev_heading to all chunks
+            prev_heading = None
+            for j in range(i - 1, -1, -1):
+                if "heading" in chunks[j].metadata:
+                    prev_heading = chunks[j].metadata["heading"]
+                    break
+            chunks[i].metadata["prev_heading"] = prev_heading
+            chunks[i].metadata["page"] = extracted_elements[0]["page"] if extracted_elements else 1
+
+    except Exception as e:
+        logging.error(f"Error processing {pdf_path}: {e}")
+        return []
+
+    return chunks
+
+
+def ingest_docs():
+    urls = [
+        "https://www.hermanmiller.com/content/dam/hermanmiller/documents/pricing/PB_CWB.pdf"
+    ]
+
+    all_docs: List[Document] = []
+
+    for url in urls:
+        logging.info(f"Processing {url}")
+        pdf_path = download_pdf(url)
+        if not pdf_path:
+            logging.warning(f"Skipping {url} due to download failure")
+            continue
+
+        all_docs.extend(process_pdf(pdf_path))
+
+    logging.info(f"Loaded {len(all_docs)} raw pages from PDF(s)")
+
+    min_length = 50
+    filtered_docs = []
+    discarded_count = 0
+    filter_patterns = [
+        r"(HermanMiller|Appendix|Index|Page|Prices|continued|\d+ of \d+)",
+        r"^\s*$",
+        r"^\d{1,2}\/\d{1,2}\/\d{2,4}$" # added date pattern to filter
+    ]
+
+    for doc in all_docs:
+        content = doc.page_content.strip()
+        if len(content) > min_length and not any(
+            re.search(pattern, content, re.IGNORECASE) for pattern in filter_patterns
+        ):
+            filtered_docs.append(doc)
+        else:
+            discarded_count += 1
+            logging.debug(
+                f'Filtered out short or irrelevant chunk ({len(content)} chars): "{content[:40]}..."'
+            )
+
+    split_docs = filtered_docs
+    logging.info(f"Discarded {discarded_count} short or irrelevant chunks")
+    logging.info(f"Retained {len(split_docs)} chunks for indexing")
+
+    for doc in split_docs:
+        doc.metadata = clean_metadata(doc.metadata)
+
+    PineconeVectorStore.from_documents(
+        documents=split_docs, embedding=embeddings, index_name=INDEX_NAME
+    )
+
+    logging.info(f"Indexed {len(split_docs)} chunks to Pinecone index '{INDEX_NAME}'")
+
+
+# --- Main ---
 
 if __name__ == "__main__":
     ingest_docs()
-    print("Ingestion completed.")
+    logging.info("Ingestion completed")

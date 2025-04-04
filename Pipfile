@@ -23,11 +23,13 @@ pillow = "*"
 langchain-community = "*"
 pymupdf = "*"
 langchain-pinecone = "*"
-pdfminer = "*"
-"pdfminer.six" = "==20221105"
 pdf2image = "*"
 unstructured = {extras = ["local-inference"], version = "*"}
 pdfplumber = "*"
+pdfminer = "*"
+"pdfminer.six" = "==20221105"
+pytz = "*"
+tzlocal = "*"
 
 [dev-packages]
 
