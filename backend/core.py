@@ -58,13 +58,20 @@ def fetch_chunks_by_part_number(part_numbers: List[str], k: int = 100):
         index_name=INDEX_NAME,
         embedding=OpenAIEmbeddings(model="text-embedding-3-large")
     )
-    all_chunks = docsearch.similarity_search("product", k=k)
+    
+    # Broad pull of all chunks (e.g., top 500) so we can scan manually
+    all_chunks = docsearch.similarity_search("FT part numbers", k=500)
 
     filtered = []
+    seen_ids = set()
     for doc in all_chunks:
         meta = doc.metadata
-        if any(pn in meta.get("part_numbers", []) for pn in part_numbers):
-            filtered.append(doc)
+        matched_parts = meta.get("part_numbers", [])
+        if any(pn in matched_parts for pn in part_numbers):
+            doc_id = f"{meta.get('page', '')}_{meta.get('image_path', '')}"
+            if doc_id not in seen_ids:
+                filtered.append(doc)
+                seen_ids.add(doc_id)
     return filtered
 
 
