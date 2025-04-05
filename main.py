@@ -11,6 +11,7 @@ from datetime import datetime
 import pytz
 from tzlocal import get_localzone
 import json
+import os
 from backend.core import run_llm, process_response
 
 
@@ -42,12 +43,15 @@ def get_profile_picture(email: str) -> Image.Image:
     img = Image.open(BytesIO(response.content))
     return img
 
+
 def format_timestamp(dt: datetime) -> str:
     return dt.strftime("%b %d, %Y • %I:%M %p").lstrip("0").replace(" 0", " ")
+
 
 def get_local_time() -> datetime:
     local_tz = get_localzone()
     return datetime.now(local_tz)
+
 
 def export_chat_history():
     history = []
@@ -57,9 +61,31 @@ def export_chat_history():
             "user_time": user["timestamp"],
             "bot_response": bot["answer"],
             "bot_time": bot["timestamp"],
-            "sources": bot["sources"]
+            "sources": bot.get("sources", []),
+            "images": bot.get("images", [])
         })
     return json.dumps(history, indent=2)
+
+
+def display_images(images: list):
+    if not images:
+        return
+
+    st.markdown("**📸 Product Images:**")
+
+    rows = [images[i:i + 4] for i in range(0, len(images), 4)]
+    for row in rows:
+        cols = st.columns(len(row))
+        for img_data, col in zip(row, cols):
+            path = img_data.get("path")
+            caption = img_data.get("caption", "Product image")
+            if os.path.exists(path):
+                with col:
+                    with st.expander(caption):
+                        st.image(path, use_column_width=True)
+            else:
+                with col:
+                    st.warning(f"Missing image: {caption}")
 
 
 # ------------------- Sidebar -------------------
@@ -89,13 +115,12 @@ with st.sidebar:
         st.info("No chat history yet.")
 
 
-# ------------------- Main Interface -------------------
+# ------------------- Main UI -------------------
 st.markdown(
     "<h1 style='text-align: center; margin-bottom: 30px;'>HermanMiller Product Helper Bot</h1>",
     unsafe_allow_html=True,
 )
 
-# Use a safe structure for layout blocks
 try:
     st.markdown("### Prompt")
     col1, col2 = st.columns([5, 1])
@@ -107,7 +132,7 @@ except st.runtime.scriptrunner.script_run_context.StopException:
     st.stop()
 
 
-# ------------------- Handle Input -------------------
+# ------------------- Process Prompt -------------------
 if 'prompt' in locals() and submit and prompt:
     timestamp = format_timestamp(get_local_time())
 
@@ -120,7 +145,9 @@ if 'prompt' in locals() and submit and prompt:
             st.markdown("**Response:**")
             st.write(processed_response["answer"])
 
-            with st.expander("Show sources"):
+            display_images(processed_response["images"])
+
+            with st.expander("📚 Show sources"):
                 for source in processed_response["sources"]:
                     source_text = f"Page {source['page']}, from {source['source']}"
                     if source["prev_heading"]:
@@ -135,6 +162,7 @@ if 'prompt' in locals() and submit and prompt:
             st.session_state["chat_answers_history"].append({
                 "answer": processed_response["answer"],
                 "sources": processed_response["sources"],
+                "images": processed_response["images"],
                 "timestamp": timestamp
             })
             st.session_state["chat_history"].append(("human", prompt))
@@ -154,8 +182,10 @@ if st.session_state["chat_answers_history"]:
         message(f"{user_msg['text']}  \n\n*{user_msg['timestamp']}*", is_user=True)
         message(f"{bot_msg['answer']}  \n\n*{bot_msg['timestamp']}*")
 
+        display_images(bot_msg.get("images", []))
+
         if st.session_state["show_all_sources"]:
-            with st.expander(f"Show sources for answer #{i + 1}"):
+            with st.expander(f"📚 Sources for answer #{i + 1}"):
                 for source in bot_msg["sources"]:
                     source_text = f"Page {source['page']}, from {source['source']}"
                     if source["prev_heading"]:
