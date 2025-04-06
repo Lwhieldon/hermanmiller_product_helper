@@ -4,7 +4,6 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-langchain = "*"
 beautifulsoup4 = "*"
 black = "*"
 tiktoken = "*"
@@ -17,19 +16,21 @@ uvicorn = "*"
 streamlit = "*"
 streamlit-chat = "*"
 tqdm = "*"
-langchain-openai = "*"
 firecrawl-py = "*"
-pillow = "*"
-langchain-community = "*"
 pymupdf = "*"
 langchain-pinecone = "*"
-pdf2image = "*"
 unstructured = {extras = ["local-inference"], version = "*"}
 pdfplumber = "*"
 pdfminer = "*"
 "pdfminer.six" = "==20221105"
 pytz = "*"
 tzlocal = "*"
+pytesseract = "*"
+pdf2image = "*"
+pillow = "*"
+langchain = "*"
+langchain-openai = "*"
+langchain-community = "*"
 
 [dev-packages]
 

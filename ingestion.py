@@ -1,32 +1,34 @@
+# ingestion.py
+
 import os
 import tempfile
 import requests
 import logging
 import re
-from typing import List
+from typing import List, Dict
 from dotenv import load_dotenv
 
 from langchain.schema import Document
 from langchain_openai import OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
+
+from pdf2image import convert_from_path
+import pytesseract
+# from PIL import Image
+
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTTextContainer, LTImage, LAParams
 from pdfminer.image import ImageWriter
 
-# Setup
 load_dotenv()
 embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-INDEX_NAME = os.getenv("INDEX_NAME")
+INDEX_NAME = os.getenv("INDEX_NAME", "hermanmiller-product-helper")
 
 TEMP_IMAGE_DIR = os.path.join(tempfile.gettempdir(), "pdf_images")
 os.makedirs(TEMP_IMAGE_DIR, exist_ok=True)
 
-logging.basicConfig(
-    filename="ingestion.log",
-    filemode="w",
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(filename="ingestion.log", level=logging.INFO, filemode="w",
+                    format="%(asctime)s [%(levelname)s] %(message)s")
 
 
 def download_pdf(url: str) -> str:
@@ -41,18 +43,22 @@ def download_pdf(url: str) -> str:
         raise Exception(f"Failed to download PDF: {url}")
 
 
-def clean_metadata(metadata: dict) -> dict:
-    return {k: v for k, v in metadata.items() if isinstance(v, (str, int, float, bool, str))}
-
-
 def is_price(text: str) -> bool:
-    return bool(re.search(r"\$\d+", text))
+    return bool(re.search(r"\d{2,4}(?:\.\d{2})?", text))
+
+
+def extract_price_values(text: str) -> List[str]:
+    return re.findall(r"(?:\$)?\d{2,4}(?:\.\d{2})?", text)
 
 
 def extract_part_numbers(text: str) -> List[str]:
     matches = re.findall(r"\bFT\d{3,4}\b", text)
     return list(set(matches))
 
+
+def extract_part_descriptions(text: str) -> List[Dict[str, str]]:
+    pattern = re.findall(r"([A-Za-z0-9 \-\/]+?)\s*\(?\b(FT\d{3,4})\)?", text)
+    return [{"part_number": pn, "description": desc.strip()} for desc, pn in pattern]
 
 
 def merge_wrapped_lines(text: str) -> str:
@@ -73,35 +79,60 @@ def save_image_from_ltimage(image_obj, page_num, index):
         image_writer.export_image(image_obj, image_name)
         return os.path.join(TEMP_IMAGE_DIR, image_name)
     except Exception as e:
-        logging.warning(f"Image extract fail (p{page_num}): {e}")
+        logging.warning(f"Failed to save image on page {page_num}: {e}")
         return None
 
 
-def extract_elements(pdf_path: str) -> List[dict]:
+def extract_elements_with_ocr(pdf_path: str) -> List[dict]:
     elements = []
     laparams = LAParams()
     pages = list(extract_pages(pdf_path, laparams=laparams))
-    for page_num, layout in enumerate(pages):
+    images = convert_from_path(pdf_path, dpi=300)
+
+    for page_idx, layout in enumerate(pages):
+        page_num = page_idx + 1
+        has_text = False
         image_index = 0
+        text_blocks = []
+
         for element in layout:
             if isinstance(element, LTTextContainer):
                 text = merge_wrapped_lines(element.get_text()).strip()
-                if not text:
-                    continue
-                typ = "heading" if element.height > 12 else ("price" if is_price(text) else "text")
-                elements.append({"type": typ, "text": text, "page": page_num + 1})
-            elif isinstance(element, LTImage):
-                image_path = save_image_from_ltimage(element, page_num + 1, image_index)
+                if text:
+                    has_text = True
+                    text_blocks.append(text)
+                    typ = "heading" if element.height > 12 else ("price" if is_price(text) else "text")
+                    elements.append({"type": typ, "text": text, "page": page_num})
+
+        if not has_text:
+            ocr_text = pytesseract.image_to_string(images[page_idx])
+            for line in ocr_text.splitlines():
+                line = line.strip()
+                if line:
+                    typ = "price" if is_price(line) else "ocr"
+                    text_blocks.append(line)
+                    elements.append({"type": typ, "text": line, "page": page_num})
+
+        page_text = " ".join(text_blocks)
+        page_part_numbers = extract_part_numbers(page_text)
+
+        for element in layout:
+            if isinstance(element, LTImage):
+                image_path = save_image_from_ltimage(element, page_num, image_index)
                 if image_path:
                     elements.append({
                         "type": "image",
                         "text": "Image",
-                        "page": page_num + 1,
-                        "image_path": image_path
+                        "page": page_num,
+                        "image_path": image_path,
+                        "linked_parts": page_part_numbers
                     })
                     image_index += 1
+
     return elements
 
+
+# ingestion.py (partial, focusing on chunk_intelligently fix)
 
 def chunk_intelligently(elements: List[dict], global_metadata: dict) -> List[Document]:
     chunks = []
@@ -109,6 +140,7 @@ def chunk_intelligently(elements: List[dict], global_metadata: dict) -> List[Doc
     current_chunk_metadata = global_metadata.copy()
 
     last_part_numbers = []
+    last_description = ""
     last_heading = ""
 
     def finish_chunk():
@@ -118,9 +150,24 @@ def chunk_intelligently(elements: List[dict], global_metadata: dict) -> List[Doc
             if part_numbers:
                 current_chunk_metadata["part_numbers"] = part_numbers
                 last_part_numbers = part_numbers
-                logging.info(f"Chunk FT codes: {part_numbers}")
-            if "$" in current_chunk_text:
+
+            desc_map = extract_part_descriptions(current_chunk_text)
+            if desc_map:
+                if len(desc_map) == 1:
+                    current_chunk_metadata["description"] = desc_map[0]["description"]
+                    last_description = desc_map[0]["description"]
+                else:
+                    all_descriptions = list({d["description"] for d in desc_map})
+                    current_chunk_metadata["descriptions"] = all_descriptions[:5]
+
+            price_lines = [line for line in current_chunk_text.splitlines() if len(extract_price_values(line)) >= 3]
+            if price_lines:
                 current_chunk_metadata["contains_pricing_table"] = True
+                all_prices = []
+                for line in price_lines:
+                    all_prices.extend(extract_price_values(line))
+                current_chunk_metadata["price_values"] = list(set(all_prices))
+
             chunks.append(Document(page_content=current_chunk_text.strip(), metadata=current_chunk_metadata.copy()))
         current_chunk_text = ""
         current_chunk_metadata = global_metadata.copy()
@@ -143,14 +190,26 @@ def chunk_intelligently(elements: List[dict], global_metadata: dict) -> List[Doc
                 **global_metadata,
                 "type": "image",
                 "image_path": element["image_path"],
-                "page": page
+                "page": page,
             }
             if last_heading:
                 image_meta["prev_heading"] = last_heading
-            if last_part_numbers:
-                image_meta["part_numbers"] = last_part_numbers
-                logging.info(f"Image at page {page} linked to FT: {last_part_numbers}")
-            chunks.append(Document("Image related to product", metadata=image_meta))
+            if last_description:
+                image_meta["description"] = last_description
+
+            if "linked_parts" in element:
+                image_meta["part_numbers"] = list(set(element["linked_parts"]))
+            elif last_part_numbers:
+                image_meta["part_numbers"] = list(set(last_part_numbers))
+
+            if image_meta.get("part_numbers"):
+                logging.info(f"Tagged image on page {page} with parts: {image_meta['part_numbers']}")
+
+            part_info = image_meta.get("part_numbers", [])
+            desc = image_meta.get("description", "") or image_meta.get("prev_heading", "") or "unknown"
+            content = f"Illustration for {', '.join(part_info)}: {desc}" if part_info else f"Product illustration: {desc}"
+
+            chunks.append(Document(page_content=content, metadata=image_meta))
 
         elif is_short_snippet or extracted_parts:
             snippet_meta = {
@@ -159,9 +218,19 @@ def chunk_intelligently(elements: List[dict], global_metadata: dict) -> List[Doc
             }
             if extracted_parts:
                 snippet_meta["part_numbers"] = extracted_parts
-                logging.info(f"✅ FT codes from text (p{page}): {extracted_parts}")
+                last_part_numbers = extracted_parts
+
+                desc_map = extract_part_descriptions(text)
+                if desc_map:
+                    if len(desc_map) == 1:
+                        snippet_meta["description"] = desc_map[0]["description"]
+                        last_description = desc_map[0]["description"]
+                    else:
+                        all_descriptions = list({d["description"] for d in desc_map})
+                        snippet_meta["descriptions"] = all_descriptions[:5]
+
+                logging.info(f"Indexed part {extracted_parts} with desc on page {page}: {desc_map}")
             chunks.append(Document(text.strip(), metadata=snippet_meta))
-            logging.info(f"Indexed FT snippet on page {page}: {extracted_parts}")
 
         elif len(current_chunk_text) + len(text) + 1 <= 400:
             current_chunk_text += " " + text
@@ -179,17 +248,15 @@ def process_pdf(pdf_path: str) -> List[Document]:
     raw_metadata = {"source": pdf_path}
     chunks = []
     try:
-        elements = extract_elements(pdf_path)
+        elements = extract_elements_with_ocr(pdf_path)
         chunks = chunk_intelligently(elements, raw_metadata)
         for i, chunk in enumerate(chunks):
-            prev_heading = None
             for j in range(i - 1, -1, -1):
                 if "heading" in chunks[j].metadata:
-                    prev_heading = chunks[j].metadata["heading"]
+                    chunk.metadata["prev_heading"] = chunks[j].metadata["heading"]
                     break
-            chunk.metadata["prev_heading"] = prev_heading
     except Exception as e:
-        logging.error(f"PDF processing error: {e}")
+        logging.error(f"Error processing {pdf_path}: {e}")
     return chunks
 
 
@@ -203,27 +270,19 @@ def ingest_docs():
         try:
             pdf_path = download_pdf(url)
             docs = process_pdf(pdf_path)
-            for doc in docs:
-                doc.metadata["source_title"] = os.path.basename(url)
             all_docs.extend(docs)
         except Exception as e:
-            logging.error(f"Ingestion failed for {url}: {e}")
+            logging.error(f"Error ingesting from {url}: {e}")
 
-    filtered_docs = [doc for doc in all_docs if doc.page_content and (
-    len(doc.page_content.strip()) > 10 or "part_numbers" in doc.metadata)]
-
-    for doc in filtered_docs:
-        doc.metadata = clean_metadata(doc.metadata)
-
-    PineconeVectorStore.from_documents(
-        documents=filtered_docs,
-        embedding=embeddings,
-        index_name=INDEX_NAME
-    )
-
-    logging.info(f"✅ {len(filtered_docs)} chunks indexed into Pinecone.")
+    if all_docs:
+        vectorstore = PineconeVectorStore.from_documents(all_docs, embedding=embeddings, index_name=INDEX_NAME)
+        print(f"{len(all_docs)} documents ingested into Pinecone '{INDEX_NAME}' of {vectorstore}")
+    else:
+        print("No documents ingested.")
 
 
 if __name__ == "__main__":
-    ingest_docs()
-    logging.info("🎉 Ingestion complete.")
+    try:
+        ingest_docs()
+    except Exception as e:
+        print(f"Remote ingestion failed: {e}")
