@@ -76,7 +76,7 @@ streamlit run main.py
 
 Then you’ll be able to:
 
-- Ask product questions (e.g., “Show me FT123 pricing and images”)
+- Ask product questions (e.g., “What’s the price of FT165 with metallic finishes?”)
 - View images and markdown pricing tables
 - Export chat history with timestamps
 
