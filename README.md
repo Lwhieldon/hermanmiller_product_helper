@@ -1,48 +1,45 @@
 # Herman Miller Product Helper Bot 🪑🤖
 
-An AI-powered assistant for Herman Miller product data, combining **LangChain**, **OpenAI**, **Pinecone**, and **Streamlit**. This chatbot allows users to ask product-related questions and receive intelligent, citation-backed answers from ingested PDFs and webpages.
+An AI-powered chatbot that helps users query detailed product information, pricing breakdowns, finishes, features, and illustrations from Herman Miller’s pricing documents. Powered by **LangChain**, **OpenAI**, **Pinecone**, and **Streamlit**.
 
 ---
 
-## 📂 Project Structure
+## 📦 Features
 
-| File           | Description |
-|----------------|-------------|
-| `ingestion.py` | Fetches, chunks, embeds, and stores product documents into Pinecone. |
-| `main.py`      | Streamlit frontend to chat with the AI assistant and display responses. |
-| `core.py`      | Backend logic that retrieves documents and runs an LLM to generate answers. |
+- Extracts part numbers, configurations, and feature blocks (e.g., Surface Materials, MicrobeCare).
+- Parses complex price tables including finish variations (e.g., Metallic Paint).
+- Uses OCR for image-only pages.
+- Displays illustrations linked to product parts.
+- Supports timestamped chat history export with Gravatar profile integration.
+
+---
+
+## 📁 Project Structure
+
+| File         | Description |
+|--------------|-------------|
+| `ingestion.py` | Ingests product data from PDFs with OCR, pricing, and image extraction. |
+| `core.py`      | Backend RAG logic: retrieval, prompt formatting, and LLM invocation. |
+| `main.py`      | Streamlit UI for chatting with the bot and exporting chat history. |
+| `Pipfile`/`Pipfile.lock` | Dependency management via Pipenv. |
 
 ---
 
 ## 🚀 Getting Started
 
-### 1. Install Dependencies (Using Pipenv)
-
-This project uses **Pipenv** for managing dependencies and virtual environments.
-
-First, install Pipenv (if you don't have it yet):
+### 1. Install Dependencies (Pipenv)
 
 ```bash
 pip install pipenv
-```
-
-Then, install the environment from the `Pipfile` and `Pipfile.lock`:
-
-```bash
 pipenv install
-```
-
-To activate the virtual environment:
-
-```bash
 pipenv shell
 ```
 
 ---
 
-### 2. Set Up Environment Variables
+### 2. Environment Setup
 
-Create a `.env` file in your project root with the following:
+Create a `.env` file with:
 
 ```env
 OPENAI_API_KEY=your_openai_key
@@ -53,85 +50,86 @@ INDEX_NAME=hermanmiller-product-helper
 
 ---
 
-### 3. Ingest Documents
+### 3. Ingest Product PDF(s)
 
-To populate the Pinecone vector index:
+Run this to download, parse, and upload the product data:
 
 ```bash
 python ingestion.py
 ```
 
-This:
+It will:
 
-- Downloads or scrapes product pages (currently a Herman Miller PDF),
-- Splits the content into chunks,
-- Embeds them using OpenAI’s `text-embedding-3-small`,
-- Uploads them to Pinecone.
+- Download the Herman Miller PDF
+- Use OCR for non-text pages
+- Extract images and price tables
+- Embed content with `text-embedding-3-large`
+- Store it in your Pinecone index
 
 ---
 
-### 4. Run the App
-
-Launch the chatbot frontend:
+### 4. Run the Chatbot App
 
 ```bash
 streamlit run main.py
 ```
 
-You’ll get:
+Then you’ll be able to:
 
-- A sidebar with a profile (Gravatar support),
-- A clean interface for chatting with the AI bot,
-- Instant answers with source citations.
+- Ask product questions (e.g., “Show me FT123 pricing and images”)
+- View images and markdown pricing tables
+- Export chat history with timestamps
 
 ---
 
 ## 🧠 How It Works
 
-### 🗂 `ingestion.py`
+### 🔍 `ingestion.py`
+- Downloads and parses pricing PDFs
+- Uses OCR when text isn’t directly extractable
+- Detects part numbers like `FT123`, extracts features and images
+- Extracts pricing with support for finish upcharges
 
-- Loads Herman Miller product documents (e.g., PDFs),
-- Splits them into semantic chunks,
-- Embeds and stores them in Pinecone.
-
-### 🧠 `core.py`
-
-- Uses LangChain's RAG architecture:
-  - **History-aware retriever** for better conversational memory,
-  - **Retrieval QA chain** for smart document-based responses,
-- Returns results with source documents and chat continuity.
+### 🤖 `core.py`
+- Classifies query intent (e.g., pricing, image, feature)
+- Retrieves relevant chunks using filters (like part number or feature block)
+- Passes context to GPT via a structured prompt
 
 ### 💬 `main.py`
-
-- Streamlit UI to interact with the bot,
-- Sidebar user profile (name, email, avatar),
-- Chat display with source references.
-
----
-
-## 📌 Example Source
-
-Currently ingested:
-
-- [Herman Miller Chair Price Book (PB_CWB.pdf)](https://www.hermanmiller.com/content/dam/hermanmiller/documents/pricing/PB_CWB.pdf)
-
-Feel free to add more links to `documents_base_urls` in `ingestion.py`.
+- Provides a modern Streamlit interface with:
+  - Real-time Q&A
+  - Image display
+  - User info (avatar/name)
+  - JSON export of full chat history with timestamps
 
 ---
 
-## 🛠 Future Enhancements
+## 🧪 Example Supported Queries
 
-- Enable user-uploaded documents,
-- Add login/authentication support,
-- Improve error handling & feedback,
-- Cloud deployment via Streamlit Cloud or Docker.
+- “What’s the price of FT165 with metallic finishes?”
+- “Show me images of part FT123”
+- “What surface materials are available?”
+- “Give me MicrobeCare options”
+
+---
+
+## 📎 Data Source
+
+- [PB_CWB.pdf – Canvas Office Landscape Wall & Private Office Price Book](https://www.hermanmiller.com/content/dam/hermanmiller/documents/pricing/PB_CWB.pdf)
+
+---
+
+## 🔧 Future Plans
+
+- Add multi-PDF ingestion and organization
+- Cloud deployment (Streamlit Cloud, Docker)
 
 ---
 
 ## 🔗 Tech Stack
 
 - 🧠 [LangChain](https://www.langchain.com/)
-- 🧠 [OpenAI](https://openai.com/)
-- 📦 [Pinecone](https://www.pinecone.io/)
+- ✨ [OpenAI GPT-4 Turbo](https://platform.openai.com/)
+- 🧱 [Pinecone Vector DB](https://www.pinecone.io/)
 - 🌐 [Streamlit](https://streamlit.io/)
 - 📦 [Pipenv](https://pipenv.pypa.io/)
