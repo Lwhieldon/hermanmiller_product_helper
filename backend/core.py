@@ -97,10 +97,11 @@ def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
                 k=10,
                 filter={"part_numbers": {"$in": [pn.lower() for pn in part_numbers]}}
             )
+            print("Retrieved Docs (Part Numbers):", [doc.metadata for doc in docs])  # Debug: Check metadata
             if not any(len(d.page_content.strip()) > 30 for d in docs):
                 print("⚠️ Docs returned but too short — retrying without filter")
                 docs = retriever.vectorstore.similarity_search(query, k=10)
-
+                print("Retrieved Docs (Retry):", [doc.metadata for doc in docs])  # Debug: Check metadata
         elif classification == "feature":
             docs = retriever.vectorstore.similarity_search(
                 query=query,
@@ -108,6 +109,7 @@ def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
                 filter={"is_feature_block": True}
             )
             print(f"✅ Retrieved {len(docs)} feature docs with feature_block filter")
+            print("Retrieved Docs (Feature):", [doc.metadata for doc in docs])
     except Exception as e:
         print("⚠️ Filtered search failed:", e)
 
