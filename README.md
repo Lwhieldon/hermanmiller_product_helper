@@ -107,10 +107,10 @@ Then you’ll be able to:
 ## 🧪 Example Supported Queries
 
 - “What’s the price of FT165 with metallic finishes?”
-- “Show me images of part FT123”
+- “I'm considering some Herman Miller products can you tell me the price for a 6" screen for FV694?"
 - “What surface materials are available?”
 - “Give me MicrobeCare options”
-
+- “Show me images of part FT123”
 ---
 
 ## 📎 Data Source
