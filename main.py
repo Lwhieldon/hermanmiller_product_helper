@@ -1,35 +1,30 @@
-# main.py
+from dotenv import load_dotenv
+load_dotenv()
 
 import streamlit as st
-import pytz
-from datetime import datetime
-from tzlocal import get_localzone
-from backend.core import run_llm, process_response
+from streamlit_chat import message
 import hashlib
 import requests
-from PIL import Image
 from io import BytesIO
-import os
+from PIL import Image
+from datetime import datetime
+import pytz
+from tzlocal import get_localzone
 import json
+import os
+from backend.core import run_llm
 
-# ---------------------------------------
-# Page Setup
-# ---------------------------------------
-st.set_page_config(page_title="Herman Miller Product Helper", layout="wide")
-st.title("🪑 Herman Miller Product Assistant")
 
-# ---------------------------------------
-# Time Utilities
-# ---------------------------------------
-def get_local_time():
-    return datetime.now(get_localzone())
+# ------------------- Page Setup -------------------
+st.set_page_config(
+    page_title="HermanMiller Product Helper Bot",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-def format_timestamp(dt):
-    return dt.strftime("%b %d, %Y • %I:%M %p").lstrip("0").replace(" 0", " ")
 
-# ---------------------------------------
-# Session State
-# ---------------------------------------
+# ------------------- Session State -------------------
 if "chat_history" not in st.session_state:
     st.session_state["chat_history"] = []
 if "user_prompt_history" not in st.session_state:
@@ -39,19 +34,54 @@ if "chat_answers_history" not in st.session_state:
 if "show_all_sources" not in st.session_state:
     st.session_state["show_all_sources"] = False
 
-# ---------------------------------------
-# Gravatar
-# ---------------------------------------
-def get_profile_picture(email: str):
+
+# ------------------- Helper Functions -------------------
+def get_profile_picture(email: str) -> Image.Image:
     email_hash = hashlib.md5(email.strip().lower().encode()).hexdigest()
     gravatar_url = f"https://www.gravatar.com/avatar/{email_hash}?d=identicon&s=200"
     response = requests.get(gravatar_url)
     img = Image.open(BytesIO(response.content))
     return img
 
-# ---------------------------------------
-# Sidebar
-# ---------------------------------------
+def format_timestamp(dt: datetime) -> str:
+    return dt.strftime("%b %d, %Y • %I:%M %p").lstrip("0").replace(" 0", " ")
+
+def get_local_time() -> datetime:
+    local_tz = get_localzone()
+    return datetime.now(local_tz)
+
+def export_chat_history():
+    history = []
+    for user, bot in zip(st.session_state["user_prompt_history"], st.session_state["chat_answers_history"]):
+        history.append({
+            "user_prompt": user["text"],
+            "user_time": user["timestamp"],
+            "bot_response": bot["answer"],
+            "bot_time": bot["timestamp"],
+            "images": bot.get("images", [])
+        })
+    return json.dumps(history, indent=2)
+
+def display_images(images: list):
+    if not images:
+        return
+    st.markdown("**📸 Product Images:**")
+    rows = [images[i:i + 4] for i in range(0, len(images), 4)]
+    for row in rows:
+        cols = st.columns(len(row))
+        for img_data, col in zip(row, cols):
+            path = img_data.get("path")
+            caption = img_data.get("caption", "Product image")
+            if os.path.exists(path):
+                with col:
+                    with st.expander(caption):
+                        st.image(path, use_column_width=True)
+            else:
+                with col:
+                    st.warning(f"Missing image: {caption}")
+
+
+# ------------------- Sidebar -------------------
 with st.sidebar:
     st.title("User Profile")
     user_name = "Lee Whieldon"
@@ -60,106 +90,89 @@ with st.sidebar:
         profile_pic = get_profile_picture(user_email)
         st.image(profile_pic, width=150)
     except Exception:
-        st.warning("Unable to load profile image.")
-
+        st.warning("Could not load profile image.")
     st.write(f"**Name:** {user_name}")
     st.write(f"**Email:** [{user_email}](mailto:{user_email})")
 
     st.markdown("---")
     st.markdown("### Export Chat History")
     if st.session_state["user_prompt_history"]:
-        export_data = [
-            {
-                "user_prompt": u["text"],
-                "user_time": u["timestamp"],
-                "bot_response": a["answer"],
-                "bot_time": a["timestamp"],
-                "sources": a.get("sources", []),
-                "images": a.get("images", [])
-            }
-            for u, a in zip(st.session_state["user_prompt_history"], st.session_state["chat_answers_history"])
-        ]
-        st.download_button("📥 Download as JSON", data=json.dumps(export_data, indent=2),
-                           file_name="chat_history.json", mime="application/json")
+        export_data = export_chat_history()
+        st.download_button(
+            label="📥 Download as JSON",
+            data=export_data,
+            file_name="chat_history.json",
+            mime="application/json"
+        )
     else:
         st.info("No chat history yet.")
 
-# ---------------------------------------
-# Chat Input UI
-# ---------------------------------------
-st.markdown("### Ask about a product")
-col1, col2 = st.columns([5, 1])
-with col1:
-    prompt = st.text_input("Enter your message...", label_visibility="collapsed")
-with col2:
-    submit = st.button("Submit")
 
-# ---------------------------------------
-# Display Image Carousel
-# ---------------------------------------
-def display_images(images: list):
-    if not images:
-        return
-    st.markdown("**📸 Product Illustrations**")
-    rows = [images[i:i+4] for i in range(0, len(images), 4)]
-    for row in rows:
-        cols = st.columns(len(row))
-        for img_data, col in zip(row, cols):
-            if os.path.exists(img_data["path"]):
-                with col:
-                    with st.expander(img_data.get("caption", "Image")):
-                        st.image(img_data["path"], use_column_width=True)
-            else:
-                col.warning(f"Missing image: {img_data['path']}")
+# ------------------- Main UI -------------------
+st.markdown(
+    "<h1 style='text-align: center; margin-bottom: 30px;'>HermanMiller Product Helper Bot</h1>",
+    unsafe_allow_html=True,
+)
 
-# ---------------------------------------
-# Handle Submission
-# ---------------------------------------
-if prompt and submit:
+try:
+    st.markdown("### Prompt")
+    col1, col2 = st.columns([5, 1])
+    with col1:
+        prompt = st.text_input("Enter your message here...", label_visibility="collapsed")
+    with col2:
+        submit = st.button("Submit")
+except st.runtime.scriptrunner.script_run_context.StopException:
+    st.stop()
+
+
+# ------------------- Process Prompt -------------------
+if 'prompt' in locals() and submit and prompt:
     timestamp = format_timestamp(get_local_time())
-    with st.spinner("Thinking..."):
+    with st.spinner("Generating response..."):
         try:
             llm_response = run_llm(query=prompt, chat_history=st.session_state["chat_history"])
-            processed = process_response(llm_response)
+            processed_response = {
+                "answer": llm_response["answer"],
+                "images": llm_response.get("images", [])
+            }
 
-            # Save chat state
+            st.markdown("---")
+            st.markdown("**Response:**")
+            st.write(processed_response["answer"])
+
+            display_images(processed_response["images"])
+
             st.session_state["user_prompt_history"].append({
                 "text": prompt,
                 "timestamp": timestamp
             })
             st.session_state["chat_answers_history"].append({
-                "answer": processed["answer"],
-                "sources": processed["sources"],
-                "images": processed["images"],
+                "answer": processed_response["answer"],
+                "images": processed_response["images"],
                 "timestamp": timestamp
             })
             st.session_state["chat_history"].append(("human", prompt))
-            st.session_state["chat_history"].append(("ai", processed["answer"]))
+            st.session_state["chat_history"].append(("ai", processed_response["answer"]))
 
         except Exception as e:
-            st.error(f"Error generating response: {e}")
+            st.error(f"An error occurred while generating a response: {e}")
 
-# ---------------------------------------
-# Chat Display
-# ---------------------------------------
+
+# ------------------- Chat History -------------------
 if st.session_state["chat_answers_history"]:
+    st.markdown("---")
     for i in range(len(st.session_state["chat_answers_history"]) - 1, -1, -1):
         user_msg = st.session_state["user_prompt_history"][i]
         bot_msg = st.session_state["chat_answers_history"][i]
 
-        st.markdown(f"**🧑 You**: {user_msg['text']}  \n*{user_msg['timestamp']}*")
-        st.markdown(f"**🤖 Assistant**:  \n{bot_msg['answer']}  \n*{bot_msg['timestamp']}*")
+        message(f"{user_msg['text']}  \n\n*{user_msg['timestamp']}*", is_user=True)
+        message(f"{bot_msg['answer']}  \n\n*{bot_msg['timestamp']}*")
 
         display_images(bot_msg.get("images", []))
 
-        if bot_msg["sources"]:
-            with st.expander("📚 Sources"):
-                for src in bot_msg["sources"]:
-                    pg = src.get("page", "Unknown")
-                    heading = src.get("heading") or src.get("prev_heading") or "Section"
-                    st.markdown(f"- Page {pg}: *{heading}*")
 
-# ---------------------------------------
-# Footer
-# ---------------------------------------
-st.markdown("<hr><p style='text-align:center; color:gray;'>Powered by LangChain + Streamlit</p>", unsafe_allow_html=True)
+# ------------------- Footer -------------------
+st.markdown(
+    "<hr><p style='text-align: center; color: gray;'>App Powered by LangChain and Streamlit</p>",
+    unsafe_allow_html=True,
+)

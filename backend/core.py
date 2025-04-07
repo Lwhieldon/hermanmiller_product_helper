@@ -1,96 +1,139 @@
-# core.py
-
 import re
 from typing import List, Dict, Any
 from langchain_core.documents import Document
-from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores import Pinecone
-from dotenv import load_dotenv
+from langchain.prompts import ChatPromptTemplate
+from langchain_pinecone import PineconeVectorStore
 import os
+from dotenv import load_dotenv
 
 load_dotenv()
+
 INDEX_NAME = os.getenv("INDEX_NAME", "hermanmiller-product-helper")
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4-turbo")
 
-llm = ChatOpenAI(model=MODEL_NAME, temperature=0)
-embedding = OpenAIEmbeddings(model="text-embedding-3-large")
-vectorstore = Pinecone.from_existing_index(index_name=INDEX_NAME, embedding=embedding)
-retriever = vectorstore.as_retriever(search_kwargs={"k": 30})
+retriever = PineconeVectorStore.from_existing_index(
+    index_name=INDEX_NAME,
+    embedding=OpenAIEmbeddings(model="text-embedding-3-large"),
+    text_key="page_content"
+).as_retriever()
 
-custom_prompt = PromptTemplate(
-    input_variables=["context", "question"],
-    template="""
-You are a helpful assistant that answers questions about Herman Miller products using specifications, images, and pricing data.
-When possible, you provide a pricing table in markdown format when asked about pricing. But only return pricing tables if it will helps the user.
-{context}
+llm = ChatOpenAI(model="gpt-4-turbo", temperature=0)
 
-Question: {question}
-Helpful Answer:
-""",
+def classify_query(query: str) -> str:
+    query = query.lower()
+    if any(term in query for term in ["price", "pricing", "cost", "$"]):
+        return "pricing"
+    elif any(term in query for term in ["image", "illustration", "diagram", "picture"]):
+        return "image"
+    elif any(term in query for term in [
+        "material", "finish", "surface", "edge", "microbecare", "bracket",
+        "veneer", "glass", "fabric", "top cap"
+    ]):
+        return "feature"
+    else:
+        return "general"
+
+prompt = ChatPromptTemplate.from_template(
+    """
+    You are a helpful product expert for Herman Miller. Answer the question below using the provided context.
+
+    - If a product or part number appears with pricing, output it as a clean markdown table.
+    - Include any variations in finishes (e.g., Metallic Paint), dimensions, and options.
+    - Only include prices and specs that are explicitly found in the context.
+    - Do not invent or guess missing values — leave them blank or say "not found".
+    - If prices or product specs are partially available, try building a markdown table with as much as possible.
+    - If something is unclear, note it as \"unknown\" or \"not listed\" rather than rejecting the response.
+
+    CONTEXT:
+    {context}
+
+    QUESTION:
+    {input}
+
+    Helpful Answer:
+    """
 )
 
-def qa_chain(docs: List[Document], question: str) -> str:
-    context = "\n\n".join(doc.page_content for doc in docs)
-    prompt = custom_prompt.format(context=context, question=question)
-    return llm.invoke(prompt)
+MAX_TOKENS = 100000
 
-def run_llm(query: str) -> Dict[str, Any]:
-    docs = retriever.invoke(query)
-    answer = qa_chain(docs, query)
-    return {
-        "question": query,
-        "source_documents": docs,
-        "llm_answer": answer,
-    }
-
-def process_response(response: Dict[str, Any]) -> Dict[str, Any]:
-    raw_answer = str(response.get("llm_answer", "")).strip()
-    docs = response.get("source_documents", [])
-    question = response.get("question", "").lower()
-
-    part_numbers = re.findall(r"\bFT\d{3,4}\b", question)
-    images = []
-    sources = []
-
-    def extract_image(doc):
-        meta = doc.metadata
-        return {
-            "path": meta["image_path"],
-            "caption": meta.get("description") or meta.get("heading") or meta.get("prev_heading") or f"Page {meta.get('page')}"
-        }
-
+def truncate_docs(docs: List[Document], max_tokens: int = MAX_TOKENS) -> str:
+    total_tokens = 0
+    context_parts = []
     for doc in docs:
-        meta = doc.metadata
-        if meta.get("image_path"):
-            img_data = extract_image(doc)
-            if img_data not in images:
-                images.append(img_data)
+        text = doc.page_content
+        token_count = len(text.split())  # Approximate
+        if total_tokens + token_count > max_tokens:
+            break
+        context_parts.append(text)
+        total_tokens += token_count
+    return "\n\n".join(context_parts)
 
-        sources.append({
-            "page": meta.get("page", "Unknown"),
-            "source": meta.get("source", "Unknown"),
-            "heading": meta.get("heading"),
-            "prev_heading": meta.get("prev_heading")
-        })
+def extract_part_numbers_from_query(query: str) -> List[str]:
+    return re.findall(r"\b[A-Z]{2}\d{3,4}\b", query.upper())
+
+def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
+    classification = classify_query(query)
+    part_numbers = extract_part_numbers_from_query(query)
+
+    docs = []
+    try:
+        if part_numbers:
+            docs = retriever.vectorstore.similarity_search(
+                query=query,
+                k=10,
+                filter={"part_numbers": {"$in": [pn.lower() for pn in part_numbers]}}
+            )
+            # print(f"✅ Retrieved {len(docs)} docs via part_numbers filter: {part_numbers}")
+
+            # 🔁 Fallback if pricing chunks are empty
+            if not any(len(d.page_content.strip()) > 30 for d in docs):
+                print("⚠️ Docs returned but too short — retrying without filter")
+                docs = retriever.vectorstore.similarity_search(query, k=10)
+
+        elif classification == "feature":
+            docs = retriever.vectorstore.similarity_search(
+                query=query,
+                k=10,
+                filter={"is_feature_block": True}
+            )
+            print(f"✅ Retrieved {len(docs)} feature docs with feature_block filter")
+    except Exception as e:
+        print("⚠️ Filtered search failed:", e)
+
+    if not docs:
+        print("⚠️ No docs from filtered search — falling back to default retrieval")
+        docs = retriever.invoke(query)
+
+    context = truncate_docs(docs)
+    # print("\n📄 Final context passed to GPT:\n")
+    # print(context[:3000])
+    # print("\n--- END CONTEXT ---\n")
+
+    response = (
+        prompt
+        | llm
+        | StrOutputParser()
+    ).invoke({"context": context, "input": query})
 
     return {
-        "answer": format_answer_as_markdown_table(raw_answer),
-        "sources": sources,
-        "images": images[:4]  # Limit to 4 images
+        "answer": response,
+        "type": classification,
+        "sources": get_relevant_sources_from_docs(docs),
+        "images": get_relevant_images_from_docs(docs) if classification in ["image", "pricing"] else []
     }
 
-def format_answer_as_markdown_table(text: str) -> str:
-    lines = text.strip().splitlines()
-    table_lines = [line for line in lines if re.search(r"\|.*\d", line)]
-    if not table_lines:
-        return text
-    header = table_lines[0]
-    separator = "|".join(["---"] * len(header.split("|")))
-    return "\n".join([header, separator] + table_lines[1:])
+def get_relevant_sources_from_docs(docs: List[Document]) -> List[Dict[str, Any]]:
+    return [ {
+        "page": doc.metadata.get("page"),
+        "pages": doc.metadata.get("pages"),
+        "heading": doc.metadata.get("heading"),
+        "prev_heading": doc.metadata.get("prev_heading")
+    } for doc in docs ]
 
-if __name__ == "__main__":
-    query = "Tell me what products you can provide an image for?"
-    response = process_response(run_llm(query))
-    print(response)
+def get_relevant_images_from_docs(docs: List[Document]) -> List[Dict[str, Any]]:
+    return [ {
+        "path": doc.metadata["image_path"],
+        "caption": doc.metadata.get("caption"),
+        "page": doc.metadata.get("page")
+    } for doc in docs if "image_path" in doc.metadata ]
