@@ -22,8 +22,8 @@ retriever = vectorstore.as_retriever(search_kwargs={"k": 30})
 custom_prompt = PromptTemplate(
     input_variables=["context", "question"],
     template="""
-You are a helpful assistant that answers questions about Herman Miller products using specification and pricing data.
-
+You are a helpful assistant that answers questions about Herman Miller products using specifications, images, and pricing data.
+When possible, you provide a pricing table in markdown format when asked about pricing. But only return pricing tables if it will helps the user.
 {context}
 
 Question: {question}
@@ -91,6 +91,6 @@ def format_answer_as_markdown_table(text: str) -> str:
     return "\n".join([header, separator] + table_lines[1:])
 
 if __name__ == "__main__":
-    query = "Show me FT123 illustrations and pricing"
+    query = "Tell me what products you can provide an image for?"
     response = process_response(run_llm(query))
     print(response)
