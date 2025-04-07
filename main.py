@@ -64,6 +64,7 @@ def export_chat_history():
 
 def display_images(images: list):
     if not images:
+        st.info("No images were found for this query.")
         return
     st.markdown("**📸 Product Images:**")
     rows = [images[i:i + 4] for i in range(0, len(images), 4)]
@@ -79,7 +80,6 @@ def display_images(images: list):
             else:
                 with col:
                     st.warning(f"Missing image: {caption}")
-
 
 # ------------------- Sidebar -------------------
 with st.sidebar:

@@ -36,14 +36,18 @@ def classify_query(query: str) -> str:
 
 prompt = ChatPromptTemplate.from_template(
     """
-    You are a helpful product expert for Herman Miller. Answer the question below using the provided context.
+    You are a helpful product expert for Herman Miller. Use the chat history and provided context to answer the latest question.
 
     - If a product or part number appears with pricing, output it as a clean markdown table.
     - Include any variations in finishes (e.g., Metallic Paint), dimensions, and options.
     - Only include prices and specs that are explicitly found in the context.
+    - If images are available for a product or part number, include them in the response with captions.
     - Do not invent or guess missing values — leave them blank or say "not found".
     - If prices or product specs are partially available, try building a markdown table with as much as possible.
-    - If something is unclear, note it as \"unknown\" or \"not listed\" rather than rejecting the response.
+    - If something is unclear, note it as "unknown" or "not listed" rather than rejecting the response.
+
+    CHAT HISTORY:
+    {chat_history}
 
     CONTEXT:
     {context}
@@ -72,6 +76,15 @@ def truncate_docs(docs: List[Document], max_tokens: int = MAX_TOKENS) -> str:
 def extract_part_numbers_from_query(query: str) -> List[str]:
     return re.findall(r"\b[A-Z]{2}\d{3,4}\b", query.upper())
 
+def format_chat_history(history: List[str]) -> str:
+    formatted = []
+    for role, text in history[-10:]:  # Last 10 exchanges for context
+        if role == "human":
+            formatted.append(f"User: {text}")
+        else:
+            formatted.append(f"Assistant: {text}")
+    return "\n".join(formatted)
+
 def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
     classification = classify_query(query)
     part_numbers = extract_part_numbers_from_query(query)
@@ -84,9 +97,6 @@ def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
                 k=10,
                 filter={"part_numbers": {"$in": [pn.lower() for pn in part_numbers]}}
             )
-            # print(f"✅ Retrieved {len(docs)} docs via part_numbers filter: {part_numbers}")
-
-            # 🔁 Fallback if pricing chunks are empty
             if not any(len(d.page_content.strip()) > 30 for d in docs):
                 print("⚠️ Docs returned but too short — retrying without filter")
                 docs = retriever.vectorstore.similarity_search(query, k=10)
@@ -106,15 +116,17 @@ def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
         docs = retriever.invoke(query)
 
     context = truncate_docs(docs)
-    # print("\n📄 Final context passed to GPT:\n")
-    # print(context[:3000])
-    # print("\n--- END CONTEXT ---\n")
+    chat_history_text = format_chat_history(chat_history)
 
     response = (
         prompt
         | llm
         | StrOutputParser()
-    ).invoke({"context": context, "input": query})
+    ).invoke({
+        "context": context,
+        "input": query,
+        "chat_history": chat_history_text
+    })
 
     return {
         "answer": response,
