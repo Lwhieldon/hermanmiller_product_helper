@@ -24,40 +24,42 @@ def classify_query(query: str) -> str:
     query = query.lower()
     if any(term in query for term in ["price", "pricing", "cost", "$"]):
         return "pricing"
-    elif any(term in query for term in ["image", "illustration", "diagram", "picture"]):
+    elif any(term in query for term in ["image", "illustration", "diagram", "picture", "photo", "drawing"]):
         return "image"
-    elif any(term in query for term in [
-        "material", "finish", "surface", "edge", "microbecare", "bracket",
-        "veneer", "glass", "fabric", "top cap"
-    ]):
+    elif any(term in query for term in ["material", "finish", "surface", "edge", "veneer", "glass", "fabric", "coating", "bracket", "microbecare", "attachment"]):
         return "feature"
-    else:
-        return "general"
+    return "general"
 
-prompt = ChatPromptTemplate.from_template(
-    """
-    You are a helpful product expert for Herman Miller. Use the chat history and provided context to answer the latest question.
+prompt = ChatPromptTemplate.from_template("""
+You are a helpful product expert for Herman Miller. Use the chat history and provided context to answer the latest question.
 
-    - If a product or part number appears with pricing, output it as a clean markdown table.
-    - Include any variations in finishes (e.g., Metallic Paint), dimensions, and options.
-    - Only include prices and specs that are explicitly found in the context.
-    - If images are available for a product or part number, include them in the response with captions.
-    - Do not invent or guess missing values — leave them blank or say "not found".
-    - If prices or product specs are partially available, try building a markdown table with as much as possible.
-    - If something is unclear, note it as "unknown" or "not listed" rather than rejecting the response.
+- If a product or part number appears with pricing, output it as a clean markdown table.
+- If the user asks about finishes, materials, MicrobeCare™, or bracket options, include them from any feature blocks or descriptive text.
+- If images are available, include them with captions and page numbers.
+- If something is not found in the context, say "not listed" or "not available".
+- Never make up prices or specifications.
 
-    CHAT HISTORY:
-    {chat_history}
+Examples:
+Q: Do you have any images related to FT292?
+A: Yes, image illustrations are available — see below.
 
-    CONTEXT:
-    {context}
+Q: What are the MicrobeCare™ options and what does it protect against?
+A: MicrobeCare™ is an antimicrobial coating. Available for surfaces: yes. Protects against: mold, mildew, bacteria.
 
-    QUESTION:
-    {input}
+Q: What are the door material options for sliding door storage units?
+A: Veneer, glass, painted steel, thermoplastic laminate.
 
-    Helpful Answer:
-    """
-)
+CHAT HISTORY:
+{chat_history}
+
+CONTEXT:
+{context}
+
+QUESTION:
+{input}
+
+Helpful Answer:
+""")
 
 MAX_TOKENS = 100000
 
@@ -66,7 +68,7 @@ def truncate_docs(docs: List[Document], max_tokens: int = MAX_TOKENS) -> str:
     context_parts = []
     for doc in docs:
         text = doc.page_content
-        token_count = len(text.split())  # Approximate
+        token_count = len(text.split())
         if total_tokens + token_count > max_tokens:
             break
         context_parts.append(text)
@@ -74,15 +76,15 @@ def truncate_docs(docs: List[Document], max_tokens: int = MAX_TOKENS) -> str:
     return "\n\n".join(context_parts)
 
 def extract_part_numbers_from_query(query: str) -> List[str]:
-    return re.findall(r"\b[A-Z]{2}\d{3,4}\b", query.upper())
+    query = query.upper()
+    parts = re.split(r"[,+&/]+|\band\b", query)
+    return list({pn.strip() for pn in parts if re.match(r"\b[A-Z]{2}\d{3,4}\b", pn.strip())})
 
 def format_chat_history(history: List[str]) -> str:
     formatted = []
-    for role, text in history[-10:]:  # Last 10 exchanges for context
-        if role == "human":
-            formatted.append(f"User: {text}")
-        else:
-            formatted.append(f"Assistant: {text}")
+    for role, text in history[-10:]:
+        prefix = "User" if role == "human" else "Assistant"
+        formatted.append(f"{prefix}: {text}")
     return "\n".join(formatted)
 
 def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
@@ -98,7 +100,6 @@ def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
                 filter={"part_numbers": {"$in": [pn.lower() for pn in part_numbers]}}
             )
             if not any(len(d.page_content.strip()) > 30 for d in docs):
-                print("⚠️ Docs too short — retrying without filter")
                 docs = retriever.vectorstore.similarity_search(query, k=20)
         elif classification == "feature":
             docs = retriever.vectorstore.similarity_search(
@@ -111,24 +112,29 @@ def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
     except Exception as e:
         print("⚠️ Filtered search failed:", e)
 
-    # Fallback image retrieval if needed
     image_docs = []
     if part_numbers:
         try:
             image_docs = retriever.vectorstore.similarity_search(
-                query=" ".join(part_numbers),
-                k=10,
-                filter={"image_path": {"$exists": True}}
+                query="illustration",
+                k=50,
+                filter={"part_numbers": {"$in": [pn.lower() for pn in part_numbers]},
+                        "image_path": {"$exists": True}}
             )
-            image_docs = [
-                doc for doc in image_docs
-                if any(pn.lower() in doc.metadata.get("part_numbers", []) for pn in part_numbers)
-            ]
         except Exception as e:
-            print("⚠️ Image fallback retrieval failed:", e)
+            print("⚠️ Image metadata fallback failed:", e)
 
-    # Deduplicate and merge
-    all_docs = docs + [d for d in image_docs if d not in docs]
+    seen_ids = set()
+    all_docs = []
+    for doc in docs + image_docs:
+        doc_id = (
+            doc.metadata.get("page"),
+            doc.metadata.get("image_path"),
+            doc.metadata.get("chunk_index")
+        )
+        if doc_id not in seen_ids:
+            all_docs.append(doc)
+            seen_ids.add(doc_id)
 
     context = truncate_docs(all_docs)
     chat_history_text = format_chat_history(chat_history)
@@ -151,25 +157,23 @@ def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
     }
 
 def get_relevant_sources_from_docs(docs: List[Document]) -> List[Dict[str, Any]]:
-    return [{
-        "page": doc.metadata.get("page"),
-        "pages": doc.metadata.get("pages"),
-        "heading": doc.metadata.get("heading"),
-        "prev_heading": doc.metadata.get("prev_heading")
-    } for doc in docs]
+    return [doc.metadata for doc in docs if doc.metadata.get("page")]
 
 def get_relevant_images_from_docs(docs: List[Document], part_numbers: List[str] = None) -> List[Dict[str, Any]]:
     images = []
     for doc in docs:
-        if "image_path" not in doc.metadata:
+        meta = doc.metadata
+        if "image_path" not in meta:
             continue
         if part_numbers:
-            doc_parts = doc.metadata.get("part_numbers", [])
+            doc_parts = meta.get("part_numbers", [])
             if not any(pn.lower() in doc_parts for pn in part_numbers):
                 continue
         images.append({
-            "path": doc.metadata["image_path"],
-            "caption": doc.metadata.get("caption", "Product illustration"),
-            "page": doc.metadata.get("page")
+            "path": meta["image_path"],
+            "caption": meta.get("caption", "Product illustration"),
+            "page": meta.get("page"),
+            "source": meta.get("source"),
+            "part_numbers": meta.get("part_numbers", [])
         })
     return images

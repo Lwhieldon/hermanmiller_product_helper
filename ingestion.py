@@ -1,4 +1,4 @@
-import fitz  # PyMuPDF
+import fitz
 import pytesseract
 from PIL import Image
 import os
@@ -6,7 +6,8 @@ import tempfile
 import re
 import logging
 import requests
-from typing import List
+import json
+from typing import List, Dict, Any
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
@@ -20,8 +21,24 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 logging.basicConfig(filename="ingestion.log", level=logging.INFO, filemode="w",
                     format="%(asctime)s [%(levelname)s] %(message)s")
 
-INDEX_NAME = os.getenv("INDEX_NAME", "hermanmiller-product-helper")
+INDEX_NAME_2 = os.getenv("INDEX_NAME_2", "hermanmiller-product-helper-images")
 embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+
+SAFE_LIMIT_BYTES = 39000
+
+FEATURE_TERMS = [
+    "microbecare", "surface material", "veneer", "glass", "edge options",
+    "eased-edge", "thin-edge", "squared-edge", "sliding door", "bracket",
+    "attachment", "paint finish", "textile", "coating", "surface option",
+    "top cap", "screen", "panel", "grommet", "laminate"
+]
+
+def is_too_large(content: str, metadata: Dict[str, Any]) -> bool:
+    combined_size = len(content.encode("utf-8")) + len(json.dumps(metadata).encode("utf-8"))
+    return combined_size > SAFE_LIMIT_BYTES
+
+def is_feature_page(text: str) -> bool:
+    return any(term in text.lower() for term in FEATURE_TERMS)
 
 def download_pdf(url: str) -> str:
     response = requests.get(url)
@@ -30,7 +47,7 @@ def download_pdf(url: str) -> str:
         temp_path = os.path.join(tempfile.gettempdir(), filename)
         with open(temp_path, "wb") as f:
             f.write(response.content)
-        logging.info(f"PDF downloaded: {temp_path}")
+        logging.info(f"📥 PDF downloaded: {temp_path}")
         return temp_path
     else:
         raise Exception(f"Failed to download PDF: {url}")
@@ -40,38 +57,21 @@ def extract_text_with_ocr(page):
         pix = page.get_pixmap(dpi=300)
         tmp.write(pix.tobytes("png"))
         tmp_path = tmp.name
-
-    image = Image.open(tmp_path)
-    text = pytesseract.image_to_string(image)
+    image = Image.open(tmp_path).convert("L").resize((pix.width * 2, pix.height * 2))
     os.remove(tmp_path)
-    return text.strip()
+    return pytesseract.image_to_string(image, config="--psm 6").strip()
 
-def extract_images_and_illustrations(doc):
-    image_data = []
-    for i in range(len(doc)):
-        page = doc[i]
-        images = page.get_images(full=True)
-        for img_index, img in enumerate(images):
-            xref = img[0]
-            base_image = doc.extract_image(xref)
-            img_bytes = base_image["image"]
-            img_ext = base_image["ext"]
-            img_filename = f"page_{i+1}_img{img_index+1}.{img_ext}"
-            img_path = os.path.join(OUTPUT_DIR, img_filename)
-            with open(img_path, "wb") as f:
-                f.write(img_bytes)
-            image_data.append({
-                "page": i + 1,
-                "path": img_path,
-                "caption": f"Illustration on page {i+1}"
-            })
-    return image_data
+def extract_top_header_text(page, dpi=300, crop_ratio=0.2):
+    pix = page.get_pixmap(dpi=dpi)
+    image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    top_crop = image.crop((0, 0, pix.width, int(pix.height * crop_ratio)))
+    top_crop = top_crop.resize((top_crop.width * 2, top_crop.height * 2))
+    text = pytesseract.image_to_string(top_crop, config="--psm 6").strip().lower()
+    logging.info(f"🔍 Header OCR on page {page.number + 1}: {text}")
+    return text
 
 def extract_part_numbers(text: str) -> List[str]:
-    return list(set(re.findall(r"\b[A-Z]{2}\d{3,4}\b", text)))
-
-def extract_price_values(text: str) -> List[str]:
-    return re.findall(r"(?:\$)?\d{2,4}(?:\.\d{2})?", text)
+    return list({match.lower() for match in re.findall(r"\b[A-Z]{2}\d{3,4}\b", text)})
 
 def extract_pricing_table_as_markdown(text: str) -> str:
     import pandas as pd
@@ -86,7 +86,6 @@ def extract_pricing_table_as_markdown(text: str) -> str:
         if len(all_cells) >= 2:
             rows.append(all_cells)
     if not rows:
-        logging.info("No valid pricing rows found.")
         return ""
     max_cols = max(len(row) for row in rows)
     headers = ["Col" + str(i + 1) for i in range(max_cols)]
@@ -94,109 +93,117 @@ def extract_pricing_table_as_markdown(text: str) -> str:
         while len(row) < max_cols:
             row.append("")
     df = pd.DataFrame(rows, columns=headers)
-    logging.info(f"Extracted pricing table with {len(rows)} rows and {max_cols} columns")
     return df.to_markdown(index=False)
 
-def extract_feature_blocks(text: str):
-    features = []
-    feature_keywords = [
-        ("Surface Materials", r"(?i)surface material[s]?:?\s*(.*?)\n\n"),
-        ("Edge Options", r"(?i)edge option[s]?:?\s*(.*?)\n\n"),
-        ("MicrobeCare", r"(?i)microbecare.*?\n(.*?)(?=\n\n|\Z)"),
-        ("Attachment Brackets", r"(?i)attachment bracket[s]?:?\s*(.*?)\n\n"),
-        ("Top Cap Finish", r"(?i)top cap finish.*?\n(.*?)(?=\n\n|\Z)"),
-        ("Glass Options", r"(?i)(?:screen finish|glass finish).*?\n(.*?)(?=\n\n|\Z)"),
-        ("Fabric Grades", r"(?i)price category.*?\n(.*?)(?=\n\n|\Z)"),
-        ("Veneer Options", r"(?i)veneer.*?\n(.*?)(?=\n\n|\Z)")
-    ]
-    for label, pattern in feature_keywords:
-        matches = re.findall(pattern, text, re.DOTALL)
-        for match in matches:
-            content = match.strip()
-            if content:
-                features.append(Document(
-                    page_content=f"{label} Options:\n{content}",
-                    metadata={"feature_label": label, "is_feature_block": True}
-                ))
-                logging.info(f"Extracted feature block for {label}")
-    return features
+def extract_full_page_renders_for_diagrams(doc):
+    image_data = []
+    for i in range(len(doc)):
+        page = doc[i]
+        pix = page.get_pixmap(dpi=300)
+        img_filename = f"page_{i+1:03d}_full.png"
+        img_path = os.path.join(OUTPUT_DIR, img_filename)
+        with open(img_path, "wb") as f:
+            f.write(pix.tobytes("png"))
+
+        text = page.get_text().strip()
+        found_parts = extract_part_numbers(text)
+        if not found_parts:
+            ocr_text = extract_text_with_ocr(page)
+            found_parts = extract_part_numbers(ocr_text)
+
+        logging.info(f"🧾 Parts on page {i+1}: {found_parts}")
+        image_data.append({
+            "page": i + 1,
+            "path": img_path,
+            "caption": f"Full-page render from page {i+1}",
+            "ocr_parts": found_parts
+        })
+    return image_data
+
+def split_large_combined_chunk(content: str, metadata: dict, chunk_size: int = 1000) -> List[Document]:
+    chunks = []
+    for i in range(0, len(content), chunk_size):
+        subtext = content[i:i + chunk_size]
+        submeta = dict(metadata)
+        submeta["chunk_index"] = i // chunk_size
+        if not is_too_large(subtext, submeta):
+            chunks.append(Document(page_content=subtext, metadata=submeta))
+        else:
+            logging.warning(f"⚠️ Subchunk {i//chunk_size} too large: skipped")
+    return chunks
 
 def extract_chunks_with_smart_grouping(pdf_path):
-    import pandas as pd
-    def extract_ft_price_table_with_finishes(text: str) -> str:
-        base_pattern = re.compile(r"(FT\d{3})[.\s]+(\d{2})\s+(\d{2})\s*((?:[A-Z] \$?\d{2,4}(?:\.\d{2})?\s*)+)")
-        finish_blocks = re.findall(r"(?i)(Metallic Paint.*?)\n(?:\s*\n|\Z)", text, re.DOTALL)
-        rows = []
-        for match in base_pattern.findall(text):
-            part, height, width, price_block = match
-            base_prices = dict(re.findall(r"([A-Z]) \$?(\d{2,4}(?:\.\d{2})?)", price_block))
-            for opt, base in base_prices.items():
-                rows.append([part, opt, "Standard", height, width, f"${float(base):.2f}"])
-            for finish_block in finish_blocks:
-                lines = finish_block.splitlines()
-                for line in lines:
-                    finish_info = re.findall(r"([A-Z]{2,3})\s+\+?\$?(\d+)", line)
-                    for finish_code, upcharge in finish_info:
-                        for opt, base in base_prices.items():
-                            final_price = float(base) + float(upcharge)
-                            rows.append([part, opt, finish_code, height, width, f"${final_price:.2f}"])
-        if not rows:
-            return ""
-        df = pd.DataFrame(rows, columns=["Part", "Option", "Finish", "Height", "Width", "Price"])
-        raw_finish_block = "\n".join(finish_blocks)
-        return df.to_markdown(index=False) + "\n\nFinish Modifier Info:\n" + raw_finish_block
-
-    logging.info(f"Processing file: {pdf_path}")
     doc = fitz.open(pdf_path)
-    image_metadata = extract_images_and_illustrations(doc)
+    image_metadata = extract_full_page_renders_for_diagrams(doc)
     chunks = []
     part_buffer = {}
-    image_part_map = {}
-    for i, page in enumerate(doc):
+    page_parts = {}
+
+    for i in range(len(doc)):
+        page = doc[i]
         text = page.get_text().strip()
-        if not text:
-            text = extract_text_with_ocr(page)
+        header_text = extract_top_header_text(page)
         found_parts = extract_part_numbers(text)
-        for img in image_metadata:
-            if img["page"] == i + 1:
-                image_part_map[img["path"]] = found_parts
+
+        if not found_parts and ("continued" in text.lower() or "continued" in header_text):
+            found_parts = page_parts.get(i, []) or page_parts.get(i - 1, [])
+
+        page_parts[i + 1] = found_parts
+
         if found_parts:
             for part in found_parts:
-                part_lower = part.lower()
-                if part_lower not in part_buffer:
-                    part_buffer[part_lower] = {"pages": [], "text": []}
-                part_buffer[part_lower]["pages"].append(i + 1)
-                part_buffer[part_lower]["text"].append(text)
+                part = part.lower()
+                if part not in part_buffer:
+                    part_buffer[part] = {"pages": [], "text": []}
+                part_buffer[part]["pages"].append(i + 1)
+                part_buffer[part]["text"].append(text)
         else:
-            chunks.extend(extract_feature_blocks(text))
-            meta = {"page": i + 1, "source": pdf_path}
-            chunks.append(Document(page_content=text, metadata=meta))
+            metadata = {"page": i + 1, "source": os.path.basename(pdf_path)}
+            if is_feature_page(text):
+                metadata["is_feature_block"] = True
+                logging.info(f"🧩 Flagged page {i+1} as feature block.")
+            if not is_too_large(text, metadata):
+                chunks.append(Document(page_content=text, metadata=metadata))
+
     for part, data in part_buffer.items():
         merged_text = "\n".join(data["text"])
-        markdown = extract_ft_price_table_with_finishes(merged_text) or extract_pricing_table_as_markdown(merged_text)
-        meta = {
+        markdown = extract_pricing_table_as_markdown(merged_text)
+        metadata = {
             "part_numbers": [part],
-            "joined_parts": part,
-            "pages": [str(p) for p in data["pages"]],
-            "source": pdf_path,
+            "pages": ",".join(map(str, data["pages"][:10])),
+            "source": os.path.basename(pdf_path),
             "is_pricing_table": True
         }
-        chunks.append(Document(page_content=markdown or merged_text, metadata=meta))
-        logging.info(f"Added pricing chunk for {part} with pages {data['pages']}")
+        content = markdown or merged_text
+        if is_too_large(content, metadata):
+            sub_chunks = split_large_combined_chunk(content, metadata)
+            chunks.extend(sub_chunks)
+            logging.info(f"🔀 Split pricing chunk for {part} into {len(sub_chunks)}")
+        else:
+            chunks.append(Document(page_content=content, metadata=metadata))
+            logging.info(f"💲 Added pricing chunk for {part}")
+
     for img in image_metadata:
-        related_parts = image_part_map.get(img["path"], [])
-        chunks.append(Document(
-            page_content="Image illustration",
-            metadata={
-                "page": img["page"],
-                "image_path": img["path"],
-                "caption": img["caption"],
-                "source": pdf_path,
-                "part_numbers": [p.lower() for p in related_parts] if related_parts else []
-            }
-        ))
-        logging.info(f"Linked image on page {img['page']} to parts {related_parts}")
-    logging.info(f"Finished processing {pdf_path}, total chunks: {len(chunks)}")
+        nearby_parts = set(img["ocr_parts"])
+        for offset in range(-5, 6):
+            p = page_parts.get(img["page"] + offset)
+            if p:
+                nearby_parts.update(p)
+        metadata = {
+            "page": img["page"],
+            "image_path": os.path.basename(img["path"]),
+            "caption": img["caption"],
+            "source": os.path.basename(pdf_path),
+            "part_numbers": list(sorted(nearby_parts))[:15]
+        }
+        if is_too_large("Image illustration", metadata):
+            subchunks = split_large_combined_chunk("Image illustration", metadata)
+            chunks.extend(subchunks)
+            logging.info(f"🔀 Split image chunk on page {img['page']} into {len(subchunks)}")
+        else:
+            chunks.append(Document(page_content="Image illustration", metadata=metadata))
+            logging.info(f"🔗 Linked image on page {img['page']} to: {metadata['part_numbers']}")
+
     return chunks
 
 if __name__ == "__main__":
@@ -208,24 +215,26 @@ if __name__ == "__main__":
         try:
             pdf_path = download_pdf(url)
             docs = extract_chunks_with_smart_grouping(pdf_path)
-            print(f"Extracted {len(docs)} chunks from {os.path.basename(pdf_path)}")
+            logging.info(f"Extracted {len(docs)} chunks from {os.path.basename(pdf_path)}")
             all_docs.extend(docs)
         except Exception as e:
-            print(f"Error processing {url}: {e}")
+            logging.error(f"Error processing {url}: {e}")
+
     def chunked(iterable, size):
         for i in range(0, len(iterable), size):
             yield iterable[i:i + size]
+
     if all_docs:
         total = 0
         for batch in chunked(all_docs, 100):
             PineconeVectorStore.from_documents(
                 batch,
                 embedding=embeddings,
-                index_name=INDEX_NAME,
+                index_name=INDEX_NAME_2,
                 text_key="page_content"
             )
             total += len(batch)
-            print(f"✅ Ingested {total} chunks so far...")
-        print(f"✅ Finished ingesting all {total} chunks into Pinecone index '{INDEX_NAME}'")
+            logging.info(f"✅ Ingested {total} chunks so far into {INDEX_NAME_2}")
+        logging.info("✅ Finished ingesting all chunks.")
     else:
-        print("No documents to ingest.")
+        logging.info("❌ No documents to ingest.")
