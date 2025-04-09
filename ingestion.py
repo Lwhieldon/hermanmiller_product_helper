@@ -5,7 +5,6 @@ import os
 import tempfile
 import re
 import logging
-import requests
 import json
 from typing import List, Dict, Any
 from langchain_core.documents import Document
@@ -40,18 +39,6 @@ def is_too_large(content: str, metadata: Dict[str, Any]) -> bool:
 def is_feature_page(text: str) -> bool:
     return any(term in text.lower() for term in FEATURE_TERMS)
 
-def download_pdf(url: str) -> str:
-    response = requests.get(url)
-    if response.status_code == 200:
-        filename = os.path.basename(url)
-        temp_path = os.path.join(tempfile.gettempdir(), filename)
-        with open(temp_path, "wb") as f:
-            f.write(response.content)
-        logging.info(f"📥 PDF downloaded: {temp_path}")
-        return temp_path
-    else:
-        raise Exception(f"Failed to download PDF: {url}")
-
 def extract_text_with_ocr(page):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
         pix = page.get_pixmap(dpi=300)
@@ -61,13 +48,12 @@ def extract_text_with_ocr(page):
     os.remove(tmp_path)
     return pytesseract.image_to_string(image, config="--psm 6").strip()
 
-def extract_top_header_text(page, dpi=300, crop_ratio=0.2):
+def extract_top_header_text(page, dpi=300, crop_ratio=0.2) -> str:
     pix = page.get_pixmap(dpi=dpi)
     image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     top_crop = image.crop((0, 0, pix.width, int(pix.height * crop_ratio)))
     top_crop = top_crop.resize((top_crop.width * 2, top_crop.height * 2))
-    text = pytesseract.image_to_string(top_crop, config="--psm 6").strip().lower()
-    logging.info(f"🔍 Header OCR on page {page.number + 1}: {text}")
+    text = pytesseract.image_to_string(top_crop, config="--psm 6").strip()
     return text
 
 def extract_part_numbers(text: str) -> List[str]:
@@ -95,7 +81,7 @@ def extract_pricing_table_as_markdown(text: str) -> str:
     df = pd.DataFrame(rows, columns=headers)
     return df.to_markdown(index=False)
 
-def extract_full_page_renders_for_diagrams(doc):
+def extract_image_metadata(doc, page_parts: Dict[int, List[str]], header_parts: Dict[int, List[str]]) -> List[Dict[str, Any]]:
     image_data = []
     for i in range(len(doc)):
         page = doc[i]
@@ -105,22 +91,30 @@ def extract_full_page_renders_for_diagrams(doc):
         with open(img_path, "wb") as f:
             f.write(pix.tobytes("png"))
 
-        text = page.get_text().strip()
-        found_parts = extract_part_numbers(text)
-        if not found_parts:
-            ocr_text = extract_text_with_ocr(page)
-            found_parts = extract_part_numbers(ocr_text)
+        ocr_parts = extract_part_numbers(extract_text_with_ocr(page))
+        header_text = extract_top_header_text(page)
+        header_parts_found = extract_part_numbers(header_text)
 
-        logging.info(f"🧾 Parts on page {i+1}: {found_parts}")
+        nearby_parts = set(ocr_parts + header_parts_found)
+        for offset in [-2, -1, 0, 1, 2]:
+            p = page_parts.get(i + 1 + offset)
+            if p:
+                nearby_parts.update(p)
+
         image_data.append({
             "page": i + 1,
             "path": img_path,
-            "caption": f"Full-page render from page {i+1}",
-            "ocr_parts": found_parts
+            "caption": f"Illustration from page {i + 1}",
+            "ocr_parts": ocr_parts,
+            "header_parts": header_parts_found,
+            "linked_parts": list(nearby_parts)
         })
+
+        logging.info(f"🖼️ Image on page {i+1} linked to: {list(nearby_parts)}")
+
     return image_data
 
-def split_large_combined_chunk(content: str, metadata: dict, chunk_size: int = 1000) -> List[Document]:
+def split_large_chunk(content: str, metadata: dict, chunk_size: int = 1000) -> List[Document]:
     chunks = []
     for i in range(0, len(content), chunk_size):
         subtext = content[i:i + chunk_size]
@@ -128,24 +122,25 @@ def split_large_combined_chunk(content: str, metadata: dict, chunk_size: int = 1
         submeta["chunk_index"] = i // chunk_size
         if not is_too_large(subtext, submeta):
             chunks.append(Document(page_content=subtext, metadata=submeta))
-        else:
-            logging.warning(f"⚠️ Subchunk {i//chunk_size} too large: skipped")
     return chunks
 
-def extract_chunks_with_smart_grouping(pdf_path):
+def extract_chunks_with_grouping(pdf_path: str) -> List[Document]:
     doc = fitz.open(pdf_path)
-    image_metadata = extract_full_page_renders_for_diagrams(doc)
     chunks = []
     part_buffer = {}
     page_parts = {}
+    header_parts = {}
 
     for i in range(len(doc)):
         page = doc[i]
         text = page.get_text().strip()
         header_text = extract_top_header_text(page)
         found_parts = extract_part_numbers(text)
+        header_parts_found = extract_part_numbers(header_text)
 
-        if not found_parts and ("continued" in text.lower() or "continued" in header_text):
+        header_parts[i + 1] = header_parts_found
+
+        if not found_parts and ("continued" in header_text.lower() or "continued" in text.lower()):
             found_parts = page_parts.get(i, []) or page_parts.get(i - 1, [])
 
         page_parts[i + 1] = found_parts
@@ -161,72 +156,53 @@ def extract_chunks_with_smart_grouping(pdf_path):
             metadata = {"page": i + 1, "source": os.path.basename(pdf_path)}
             if is_feature_page(text):
                 metadata["is_feature_block"] = True
-                logging.info(f"🧩 Flagged page {i+1} as feature block.")
             if not is_too_large(text, metadata):
                 chunks.append(Document(page_content=text, metadata=metadata))
 
     for part, data in part_buffer.items():
-        merged_text = "\n".join(data["text"])
-        markdown = extract_pricing_table_as_markdown(merged_text)
+        joined = "\n".join(data["text"])
+        markdown = extract_pricing_table_as_markdown(joined)
         metadata = {
             "part_numbers": [part],
             "pages": ",".join(map(str, data["pages"][:10])),
             "source": os.path.basename(pdf_path),
             "is_pricing_table": True
         }
-        content = markdown or merged_text
+        content = markdown or joined
         if is_too_large(content, metadata):
-            sub_chunks = split_large_combined_chunk(content, metadata)
-            chunks.extend(sub_chunks)
-            logging.info(f"🔀 Split pricing chunk for {part} into {len(sub_chunks)}")
+            chunks.extend(split_large_chunk(content, metadata))
         else:
             chunks.append(Document(page_content=content, metadata=metadata))
-            logging.info(f"💲 Added pricing chunk for {part}")
+        logging.info(f"💲 Added pricing chunk for {part}")
 
-    for img in image_metadata:
-        nearby_parts = set(img["ocr_parts"])
-        for offset in range(-5, 6):
-            p = page_parts.get(img["page"] + offset)
-            if p:
-                nearby_parts.update(p)
-        metadata = {
+    images = extract_image_metadata(doc, page_parts, header_parts)
+    for img in images:
+        meta = {
             "page": img["page"],
             "image_path": os.path.basename(img["path"]),
             "caption": img["caption"],
             "source": os.path.basename(pdf_path),
-            "part_numbers": list(sorted(nearby_parts))[:15]
+            "part_numbers": img["linked_parts"][:15]
         }
-        if is_too_large("Image illustration", metadata):
-            subchunks = split_large_combined_chunk("Image illustration", metadata)
-            chunks.extend(subchunks)
-            logging.info(f"🔀 Split image chunk on page {img['page']} into {len(subchunks)}")
+        if not is_too_large("Image illustration", meta):
+            chunks.append(Document(page_content="Image illustration", metadata=meta))
         else:
-            chunks.append(Document(page_content="Image illustration", metadata=metadata))
-            logging.info(f"🔗 Linked image on page {img['page']} to: {metadata['part_numbers']}")
+            chunks.extend(split_large_chunk("Image illustration", meta))
+        logging.info(f"🔗 Image chunk added from page {img['page']}")
 
     return chunks
 
 if __name__ == "__main__":
-    urls = [
-        "https://www.hermanmiller.com/content/dam/hermanmiller/documents/pricing/PB_CWB.pdf"
-    ]
-    all_docs = []
-    for url in urls:
-        try:
-            pdf_path = download_pdf(url)
-            docs = extract_chunks_with_smart_grouping(pdf_path)
-            logging.info(f"Extracted {len(docs)} chunks from {os.path.basename(pdf_path)}")
-            all_docs.extend(docs)
-        except Exception as e:
-            logging.error(f"Error processing {url}: {e}")
+    pdf_path = "PB_CWB.pdf"
+    docs = extract_chunks_with_grouping(pdf_path)
 
     def chunked(iterable, size):
         for i in range(0, len(iterable), size):
             yield iterable[i:i + size]
 
-    if all_docs:
+    if docs:
         total = 0
-        for batch in chunked(all_docs, 100):
+        for batch in chunked(docs, 100):
             PineconeVectorStore.from_documents(
                 batch,
                 embedding=embeddings,
@@ -234,7 +210,6 @@ if __name__ == "__main__":
                 text_key="page_content"
             )
             total += len(batch)
-            logging.info(f"✅ Ingested {total} chunks so far into {INDEX_NAME_2}")
-        logging.info("✅ Finished ingesting all chunks.")
+            logging.info(f"✅ Uploaded {total} chunks to Pinecone")
     else:
-        logging.info("❌ No documents to ingest.")
+        logging.warning("❌ No chunks extracted.")

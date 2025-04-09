@@ -27,20 +27,23 @@ prompt = ChatPromptTemplate.from_template("""
 You are a helpful product expert for Herman Miller. Use the chat history and provided context to answer the latest question.
 
 - If a product or part number appears with pricing, output it as a clean markdown table.
-- If the user asks about finishes, materials, MicrobeCare™, or bracket options, include them from any feature blocks or descriptive text.
-- If images are available, include them with captions and page numbers.
-- If something is not found in the context, say "not listed" or "not available".
-- Never make up prices or specifications.
+- Include any variations in finishes (e.g., Metallic Paint), dimensions, and options.
+- Only include prices and specs that are explicitly found in the context.
+- If images are available for a product or part number, include them in the response with captions and page references.
+- Do not invent or guess missing values — leave them blank or say "not found".
+- If prices or product specs are partially available, try building a markdown table with as much as possible.
+- If something is unclear, note it as "unknown" or "not listed" rather than rejecting the response.
+- Support answers for features like MicrobeCare™, surface edge options, bracket types, and finishes even if not linked to a part.
 
 Examples:
+Q: Breakdown in a pricing table FT123. In your response, output the pricing in table format.
+A: [Table based on actual PDF pricing]
+
+Q: What are the MicrobeCare™ options and what does this coating protect against?
+A: MicrobeCare™ is an antimicrobial coating that protects against mold, mildew, and bacteria. Available on panels and screen surfaces.
+
 Q: Do you have any images related to FT292?
-A: Yes, image illustrations are available — see below.
-
-Q: What are the MicrobeCare™ options and what does it protect against?
-A: MicrobeCare™ is an antimicrobial coating. Available for surfaces: yes. Protects against: mold, mildew, bacteria.
-
-Q: What are the door material options for sliding door storage units?
-A: Veneer, glass, painted steel, thermoplastic laminate.
+A: Yes, see below. These are product illustrations from the price book.
 
 CHAT HISTORY:
 {chat_history}
@@ -89,7 +92,27 @@ def log_part_result(part_numbers: List[str], found_docs: List[Document]):
         if pn.lower() in found_parts:
             logging.info(f"✅ Found part {pn}")
         else:
-            logging.warning(f"❌ Did NOT find part {pn}")
+            logging.warning(f"❌ DID NOT find part {pn}")
+
+def classify_query(query: str) -> str:
+    query = query.lower()
+    if any(term in query for term in ["price", "pricing", "cost", "$"]):
+        return "pricing"
+    elif any(term in query for term in ["image", "illustration", "diagram", "picture", "photo", "drawing"]):
+        return "image"
+    elif any(term in query for term in ["material", "finish", "surface", "edge", "veneer", "glass", "fabric", "coating", "bracket", "microbecare", "attachment"]):
+        return "feature"
+    return "general"
+
+def rank_docs(docs: List[Document]) -> List[Document]:
+    def score(doc):
+        meta = doc.metadata
+        score = 0
+        if meta.get("is_pricing_table"): score += 3
+        if meta.get("is_feature_block"): score += 2
+        if "part_numbers" in meta: score += 1
+        return score
+    return sorted(docs, key=score, reverse=True)
 
 def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
     classification = classify_query(query)
@@ -97,17 +120,14 @@ def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
 
     docs = []
     try:
+        # Step 1: Try filtered vector search
         if part_numbers:
             docs = retriever.vectorstore.similarity_search(
                 query=query,
-                k=20,
+                k=30,
                 filter={"part_numbers": {"$in": [pn.lower() for pn in part_numbers]}}
             )
             log_part_result(part_numbers, docs)
-
-            if not any(len(d.page_content.strip()) > 30 for d in docs):
-                logging.info("⚠️ No strong hits found. Falling back to full-text search.")
-                docs = retriever.vectorstore.similarity_search(query, k=20)
 
         elif classification == "feature":
             docs = retriever.vectorstore.similarity_search(
@@ -116,27 +136,30 @@ def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
                 filter={"is_feature_block": True}
             )
 
-            if not any(len(d.page_content.strip()) > 30 for d in docs):
-                logging.info("⚠️ Feature block query returned empty. Using keyword fallback.")
-                docs = retriever.vectorstore.similarity_search(query, k=20)
-
-        else:
-            docs = retriever.vectorstore.similarity_search(query, k=20)
+        # Step 2: If docs are sparse, fallback to unfiltered vector search
+        if not docs or not any(len(d.page_content.strip()) > 40 for d in docs):
+            docs = retriever.vectorstore.similarity_search(query, k=30)
 
     except Exception as e:
-        logging.error(f"⚠️ Filtered search failed: {e}")
+        logging.error(f"❌ Filtered search failed: {e}")
+        docs = retriever.vectorstore.similarity_search(query, k=30)
 
+    docs = rank_docs(docs)
+
+    # Search for image docs separately
     image_docs = []
     if part_numbers:
         try:
             image_docs = retriever.vectorstore.similarity_search(
                 query="illustration",
-                k=50,
-                filter={"part_numbers": {"$in": [pn.lower() for pn in part_numbers]},
-                        "image_path": {"$exists": True}}
+                k=40,
+                filter={
+                    "part_numbers": {"$in": [pn.lower() for pn in part_numbers]},
+                    "image_path": {"$exists": True}
+                }
             )
         except Exception as e:
-            logging.error(f"⚠️ Image metadata fallback failed: {e}")
+            logging.warning(f"⚠️ Image search failed: {e}")
 
     seen_ids = set()
     all_docs = []
@@ -170,16 +193,6 @@ def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
         "images": get_relevant_images_from_docs(all_docs, part_numbers)
     }
 
-def classify_query(query: str) -> str:
-    query = query.lower()
-    if any(term in query for term in ["price", "pricing", "cost", "$"]):
-        return "pricing"
-    elif any(term in query for term in ["image", "illustration", "diagram", "picture", "photo", "drawing"]):
-        return "image"
-    elif any(term in query for term in ["material", "finish", "surface", "edge", "veneer", "glass", "fabric", "coating", "bracket", "microbecare", "attachment"]):
-        return "feature"
-    return "general"
-
 def get_relevant_sources_from_docs(docs: List[Document]) -> List[Dict[str, Any]]:
     return [doc.metadata for doc in docs if doc.metadata.get("page")]
 
@@ -191,7 +204,9 @@ def get_relevant_images_from_docs(docs: List[Document], part_numbers: List[str] 
             continue
         if part_numbers:
             doc_parts = meta.get("part_numbers", [])
-            if not any(pn.lower() in doc_parts for pn in part_numbers):
+            match = any(pn.lower() in doc_parts for pn in part_numbers)
+            fuzzy_match = any(any(pn.lower() in part for part in doc_parts) for pn in part_numbers)
+            if not match and not fuzzy_match:
                 continue
         images.append({
             "path": meta["image_path"],
