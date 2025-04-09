@@ -33,6 +33,8 @@ if "chat_answers_history" not in st.session_state:
     st.session_state["chat_answers_history"] = []
 if "show_all_sources" not in st.session_state:
     st.session_state["show_all_sources"] = False
+if "allow_similar_images" not in st.session_state:
+    st.session_state["allow_similar_images"] = False
 
 
 # ------------------- Helper Functions -------------------
@@ -66,6 +68,15 @@ def display_images(images: list):
     if not images:
         st.info("No images were found for this query.")
         return
+
+    if not st.session_state.get("allow_similar_images", False):
+        # Filter out related illustrations unless explicitly allowed
+        images = [img for img in images if "caption" in img and "related" not in img["caption"].lower()]
+
+    if not images:
+        st.info("No matching illustrations found for this part. Try enabling similar results.")
+        return
+
     st.markdown("**📸 Product Images:**")
     rows = [images[i:i + 4] for i in range(0, len(images), 4)]
     for row in rows:
@@ -73,13 +84,17 @@ def display_images(images: list):
         for img_data, col in zip(row, cols):
             path = img_data.get("path")
             caption = img_data.get("caption", "Product image")
+            page = img_data.get("page")
+            full_caption = f"{caption} (Page {page})" if page else caption
+
             if os.path.exists(path):
                 with col:
-                    with st.expander(caption):
+                    with st.expander(full_caption):
                         st.image(path, use_column_width=True)
             else:
                 with col:
-                    st.warning(f"Missing image: {caption}")
+                    st.warning(f"Missing image: {full_caption}")
+
 
 # ------------------- Sidebar -------------------
 with st.sidebar:
@@ -106,6 +121,9 @@ with st.sidebar:
         )
     else:
         st.info("No chat history yet.")
+
+    st.markdown("---")
+    st.sidebar.checkbox("🔄 Show similar illustrations when exact match not found", key="allow_similar_images")
 
 
 # ------------------- Main UI -------------------

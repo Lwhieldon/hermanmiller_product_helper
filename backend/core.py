@@ -10,10 +10,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-INDEX_NAME = os.getenv("INDEX_NAME", "hermanmiller-product-helper")
+INDEX_NAME_2 = os.getenv("INDEX_NAME_2", "hermanmiller-product-helper-images")
 
 retriever = PineconeVectorStore.from_existing_index(
-    index_name=INDEX_NAME,
+    index_name=INDEX_NAME_2,
     embedding=OpenAIEmbeddings(model="text-embedding-3-large"),
     text_key="page_content"
 ).as_retriever()
@@ -94,30 +94,43 @@ def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
         if part_numbers:
             docs = retriever.vectorstore.similarity_search(
                 query=query,
-                k=10,
+                k=20,
                 filter={"part_numbers": {"$in": [pn.lower() for pn in part_numbers]}}
             )
-            print("Retrieved Docs (Part Numbers):", [doc.metadata for doc in docs])  # Debug: Check metadata
             if not any(len(d.page_content.strip()) > 30 for d in docs):
-                print("⚠️ Docs returned but too short — retrying without filter")
-                docs = retriever.vectorstore.similarity_search(query, k=10)
-                print("Retrieved Docs (Retry):", [doc.metadata for doc in docs])  # Debug: Check metadata
+                print("⚠️ Docs too short — retrying without filter")
+                docs = retriever.vectorstore.similarity_search(query, k=20)
         elif classification == "feature":
             docs = retriever.vectorstore.similarity_search(
                 query=query,
-                k=10,
+                k=20,
                 filter={"is_feature_block": True}
             )
-            print(f"✅ Retrieved {len(docs)} feature docs with feature_block filter")
-            print("Retrieved Docs (Feature):", [doc.metadata for doc in docs])
+        else:
+            docs = retriever.vectorstore.similarity_search(query, k=20)
     except Exception as e:
         print("⚠️ Filtered search failed:", e)
 
-    if not docs:
-        print("⚠️ No docs from filtered search — falling back to default retrieval")
-        docs = retriever.invoke(query)
+    # Fallback image retrieval if needed
+    image_docs = []
+    if part_numbers:
+        try:
+            image_docs = retriever.vectorstore.similarity_search(
+                query=" ".join(part_numbers),
+                k=10,
+                filter={"image_path": {"$exists": True}}
+            )
+            image_docs = [
+                doc for doc in image_docs
+                if any(pn.lower() in doc.metadata.get("part_numbers", []) for pn in part_numbers)
+            ]
+        except Exception as e:
+            print("⚠️ Image fallback retrieval failed:", e)
 
-    context = truncate_docs(docs)
+    # Deduplicate and merge
+    all_docs = docs + [d for d in image_docs if d not in docs]
+
+    context = truncate_docs(all_docs)
     chat_history_text = format_chat_history(chat_history)
 
     response = (
@@ -133,21 +146,30 @@ def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
     return {
         "answer": response,
         "type": classification,
-        "sources": get_relevant_sources_from_docs(docs),
-        "images": get_relevant_images_from_docs(docs) if classification in ["image", "pricing"] else []
+        "sources": get_relevant_sources_from_docs(all_docs),
+        "images": get_relevant_images_from_docs(all_docs, part_numbers)
     }
 
 def get_relevant_sources_from_docs(docs: List[Document]) -> List[Dict[str, Any]]:
-    return [ {
+    return [{
         "page": doc.metadata.get("page"),
         "pages": doc.metadata.get("pages"),
         "heading": doc.metadata.get("heading"),
         "prev_heading": doc.metadata.get("prev_heading")
-    } for doc in docs ]
+    } for doc in docs]
 
-def get_relevant_images_from_docs(docs: List[Document]) -> List[Dict[str, Any]]:
-    return [ {
-        "path": doc.metadata["image_path"],
-        "caption": doc.metadata.get("caption"),
-        "page": doc.metadata.get("page")
-    } for doc in docs if "image_path" in doc.metadata ]
+def get_relevant_images_from_docs(docs: List[Document], part_numbers: List[str] = None) -> List[Dict[str, Any]]:
+    images = []
+    for doc in docs:
+        if "image_path" not in doc.metadata:
+            continue
+        if part_numbers:
+            doc_parts = doc.metadata.get("part_numbers", [])
+            if not any(pn.lower() in doc_parts for pn in part_numbers):
+                continue
+        images.append({
+            "path": doc.metadata["image_path"],
+            "caption": doc.metadata.get("caption", "Product illustration"),
+            "page": doc.metadata.get("page")
+        })
+    return images
