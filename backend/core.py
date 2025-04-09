@@ -1,4 +1,5 @@
 import re
+import logging
 from typing import List, Dict, Any
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
@@ -20,15 +21,7 @@ retriever = PineconeVectorStore.from_existing_index(
 
 llm = ChatOpenAI(model="gpt-4-turbo", temperature=0)
 
-def classify_query(query: str) -> str:
-    query = query.lower()
-    if any(term in query for term in ["price", "pricing", "cost", "$"]):
-        return "pricing"
-    elif any(term in query for term in ["image", "illustration", "diagram", "picture", "photo", "drawing"]):
-        return "image"
-    elif any(term in query for term in ["material", "finish", "surface", "edge", "veneer", "glass", "fabric", "coating", "bracket", "microbecare", "attachment"]):
-        return "feature"
-    return "general"
+logging.basicConfig(level=logging.INFO)
 
 prompt = ChatPromptTemplate.from_template("""
 You are a helpful product expert for Herman Miller. Use the chat history and provided context to answer the latest question.
@@ -87,6 +80,17 @@ def format_chat_history(history: List[str]) -> str:
         formatted.append(f"{prefix}: {text}")
     return "\n".join(formatted)
 
+def log_part_result(part_numbers: List[str], found_docs: List[Document]):
+    found_parts = set()
+    for d in found_docs:
+        for p in d.metadata.get("part_numbers", []):
+            found_parts.add(p.lower())
+    for pn in part_numbers:
+        if pn.lower() in found_parts:
+            logging.info(f"✅ Found part {pn}")
+        else:
+            logging.warning(f"❌ Did NOT find part {pn}")
+
 def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
     classification = classify_query(query)
     part_numbers = extract_part_numbers_from_query(query)
@@ -99,18 +103,28 @@ def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
                 k=20,
                 filter={"part_numbers": {"$in": [pn.lower() for pn in part_numbers]}}
             )
+            log_part_result(part_numbers, docs)
+
             if not any(len(d.page_content.strip()) > 30 for d in docs):
+                logging.info("⚠️ No strong hits found. Falling back to full-text search.")
                 docs = retriever.vectorstore.similarity_search(query, k=20)
+
         elif classification == "feature":
             docs = retriever.vectorstore.similarity_search(
                 query=query,
                 k=20,
                 filter={"is_feature_block": True}
             )
+
+            if not any(len(d.page_content.strip()) > 30 for d in docs):
+                logging.info("⚠️ Feature block query returned empty. Using keyword fallback.")
+                docs = retriever.vectorstore.similarity_search(query, k=20)
+
         else:
             docs = retriever.vectorstore.similarity_search(query, k=20)
+
     except Exception as e:
-        print("⚠️ Filtered search failed:", e)
+        logging.error(f"⚠️ Filtered search failed: {e}")
 
     image_docs = []
     if part_numbers:
@@ -122,7 +136,7 @@ def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
                         "image_path": {"$exists": True}}
             )
         except Exception as e:
-            print("⚠️ Image metadata fallback failed:", e)
+            logging.error(f"⚠️ Image metadata fallback failed: {e}")
 
     seen_ids = set()
     all_docs = []
@@ -155,6 +169,16 @@ def run_llm(query: str, chat_history: List[str] = []) -> Dict[str, Any]:
         "sources": get_relevant_sources_from_docs(all_docs),
         "images": get_relevant_images_from_docs(all_docs, part_numbers)
     }
+
+def classify_query(query: str) -> str:
+    query = query.lower()
+    if any(term in query for term in ["price", "pricing", "cost", "$"]):
+        return "pricing"
+    elif any(term in query for term in ["image", "illustration", "diagram", "picture", "photo", "drawing"]):
+        return "image"
+    elif any(term in query for term in ["material", "finish", "surface", "edge", "veneer", "glass", "fabric", "coating", "bracket", "microbecare", "attachment"]):
+        return "feature"
+    return "general"
 
 def get_relevant_sources_from_docs(docs: List[Document]) -> List[Dict[str, Any]]:
     return [doc.metadata for doc in docs if doc.metadata.get("page")]

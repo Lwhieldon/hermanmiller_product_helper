@@ -3,14 +3,11 @@ load_dotenv()
 
 import streamlit as st
 from streamlit_chat import message
-import hashlib
-import requests
-from io import BytesIO
-from PIL import Image
 from datetime import datetime
 from tzlocal import get_localzone
 import json
 import os
+import re
 from backend.core import run_llm
 
 # ------------------- Page Setup -------------------
@@ -28,16 +25,17 @@ if "user_prompt_history" not in st.session_state:
     st.session_state["user_prompt_history"] = []
 if "chat_answers_history" not in st.session_state:
     st.session_state["chat_answers_history"] = []
-if "show_all_sources" not in st.session_state:
-    st.session_state["show_all_sources"] = False
+if "image_page" not in st.session_state:
+    st.session_state["image_page"] = 0
+if "filter_images" not in st.session_state:
+    st.session_state["filter_images"] = False
 
-# ------------------- Helper Functions -------------------
+# ------------------- Utilities -------------------
 def format_timestamp(dt: datetime) -> str:
     return dt.strftime("%b %d, %Y • %I:%M %p").lstrip("0").replace(" 0", " ")
 
 def get_local_time() -> datetime:
-    local_tz = get_localzone()
-    return datetime.now(local_tz)
+    return datetime.now(get_localzone())
 
 def export_chat_history():
     history = []
@@ -52,29 +50,6 @@ def export_chat_history():
         })
     return json.dumps(history, indent=2)
 
-def display_images(images: list):
-    if not images:
-        st.info("No images were found for this query.")
-        return
-    st.markdown("**📸 Product Images:**")
-    rows = [images[i:i + 4] for i in range(0, len(images), 4)]
-    for row in rows:
-        cols = st.columns(len(row))
-        for img_data, col in zip(row, cols):
-            path = img_data.get("path")
-            caption = img_data.get("caption", "Product image")
-            page = img_data.get("page")
-            source = img_data.get("source")
-            meta = f"📄 Page {page} | 📁 {source}" if page and source else ""
-            if os.path.exists(path):
-                with col:
-                    st.image(path, caption=caption, use_column_width=True)
-                    if meta:
-                        st.caption(meta)
-            else:
-                with col:
-                    st.warning(f"Missing image: {caption}")
-
 def display_sources(sources: list):
     if not sources:
         return
@@ -88,7 +63,55 @@ def display_sources(sources: list):
             else:
                 st.markdown(f"• 📄 Page {page} — 📁 `{source}`")
 
-# ------------------- Export History -------------------
+def display_images(images: list, part_numbers: list = []):
+    if not images:
+        st.info("No images were found for this query.")
+        return
+
+    filtered = []
+    for img in images:
+        if not st.session_state["filter_images"]:
+            filtered.append(img)
+        elif part_numbers:
+            if any(pn.lower() in img.get("part_numbers", []) for pn in part_numbers):
+                filtered.append(img)
+
+    per_page = 4
+    total = len(filtered)
+    max_pages = (total - 1) // per_page + 1 if total > 0 else 1
+
+    page = st.session_state["image_page"]
+    page = max(0, min(page, max_pages - 1))
+    start = page * per_page
+    end = start + per_page
+
+    if total == 0:
+        st.warning("No images matched your filter.")
+        return
+
+    st.markdown("**📸 Product Images:**")
+    rows = filtered[start:end]
+    cols = st.columns(len(rows))
+    for img_data, col in zip(rows, cols):
+        with col:
+            st.image(img_data["path"], caption=img_data["caption"], use_column_width=True)
+            meta = f"📄 Page {img_data.get('page')} — 📁 {img_data.get('source')}"
+            st.caption(meta)
+
+    # Pagination controls
+    col1, col2, col3 = st.columns([1, 3, 1])
+    with col1:
+        if page > 0:
+            if st.button("⬅️ Prev", key="prev"):
+                st.session_state["image_page"] -= 1
+    with col2:
+        st.markdown(f"<div style='text-align:center;'>Page {page + 1} of {max_pages}</div>", unsafe_allow_html=True)
+    with col3:
+        if page < max_pages - 1:
+            if st.button("Next ➡️", key="next"):
+                st.session_state["image_page"] += 1
+
+# ------------------- Sidebar -------------------
 st.sidebar.markdown("### Export Chat History")
 if st.session_state["user_prompt_history"]:
     export_data = export_chat_history()
@@ -107,15 +130,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-try:
-    st.markdown("### Prompt")
-    col1, col2 = st.columns([5, 1])
-    with col1:
-        prompt = st.text_input("Enter your message here...", label_visibility="collapsed")
-    with col2:
-        submit = st.button("Submit")
-except st.runtime.scriptrunner.script_run_context.StopException:
-    st.stop()
+st.markdown("### Prompt")
+col1, col2 = st.columns([5, 1])
+with col1:
+    prompt = st.text_input("Enter your message here...", label_visibility="collapsed")
+with col2:
+    submit = st.button("Submit")
 
 # ------------------- Process Prompt -------------------
 if 'prompt' in locals() and submit and prompt:
@@ -132,7 +152,14 @@ if 'prompt' in locals() and submit and prompt:
             st.markdown("---")
             st.markdown("**Response:**")
             st.write(processed_response["answer"])
-            display_images(processed_response["images"])
+
+            part_numbers = []
+            for word in prompt.split():
+                if re.match(r"[A-Z]{2}\d{3,4}", word.strip().upper()):
+                    part_numbers.append(word.strip().upper())
+
+            st.checkbox("Only show part-matched images", value=False, key="filter_images")
+            display_images(processed_response["images"], part_numbers)
             display_sources(processed_response["sources"])
 
             st.session_state["user_prompt_history"].append({
@@ -147,6 +174,7 @@ if 'prompt' in locals() and submit and prompt:
             })
             st.session_state["chat_history"].append(("human", prompt))
             st.session_state["chat_history"].append(("ai", processed_response["answer"]))
+            st.session_state["image_page"] = 0  # reset pagination
 
         except Exception as e:
             st.error(f"An error occurred while generating a response: {e}")
@@ -160,7 +188,6 @@ if st.session_state["chat_answers_history"]:
 
         message(f"{user_msg['text']}  \n\n*{user_msg['timestamp']}*", is_user=True)
         message(f"{bot_msg['answer']}  \n\n*{bot_msg['timestamp']}*")
-
         display_images(bot_msg.get("images", []))
         display_sources(bot_msg.get("sources", []))
 
