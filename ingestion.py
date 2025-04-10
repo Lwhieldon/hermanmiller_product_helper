@@ -6,6 +6,7 @@ import tempfile
 import re
 import logging
 import json
+import requests
 from typing import List, Dict, Any
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
@@ -24,7 +25,6 @@ INDEX_NAME_2 = os.getenv("INDEX_NAME_2", "hermanmiller-product-helper-images")
 embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
 
 SAFE_LIMIT_BYTES = 39000
-
 FEATURE_TERMS = [
     "microbecare", "surface material", "veneer", "glass", "edge options",
     "eased-edge", "thin-edge", "squared-edge", "sliding door", "bracket",
@@ -53,8 +53,7 @@ def extract_top_header_text(page, dpi=300, crop_ratio=0.2) -> str:
     image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
     top_crop = image.crop((0, 0, pix.width, int(pix.height * crop_ratio)))
     top_crop = top_crop.resize((top_crop.width * 2, top_crop.height * 2))
-    text = pytesseract.image_to_string(top_crop, config="--psm 6").strip()
-    return text
+    return pytesseract.image_to_string(top_crop, config="--psm 6").strip()
 
 def extract_part_numbers(text: str) -> List[str]:
     return list({match.lower() for match in re.findall(r"\b[A-Z]{2}\d{3,4}\b", text)})
@@ -193,7 +192,22 @@ def extract_chunks_with_grouping(pdf_path: str) -> List[Document]:
     return chunks
 
 if __name__ == "__main__":
-    pdf_path = "PB_CWB.pdf"
+    pdf_path = "https://www.hermanmiller.com/content/dam/hermanmiller/documents/pricing/PB_CWB.pdf"
+
+    if pdf_path.startswith("http"):
+        logging.info(f"🌐 Downloading PDF from {pdf_path}")
+        r = requests.get(pdf_path)
+        if r.status_code != 200:
+            raise RuntimeError(f"Failed to download PDF from {pdf_path}")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(r.content)
+            pdf_path = tmp_file.name
+            logging.info(f"✅ PDF downloaded to {pdf_path}")
+    else:
+        if not os.path.exists(pdf_path):
+            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+        logging.info(f"📄 Using local PDF: {pdf_path}")
+
     docs = extract_chunks_with_grouping(pdf_path)
 
     def chunked(iterable, size):
