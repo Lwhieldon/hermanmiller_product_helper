@@ -14,7 +14,6 @@ import json
 import os
 from backend.core import run_llm
 
-
 # ------------------- Page Setup -------------------
 st.set_page_config(
     page_title="HermanMiller Product Helper Bot",
@@ -22,7 +21,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
 
 # ------------------- Session State -------------------
 if "chat_history" not in st.session_state:
@@ -33,7 +31,6 @@ if "chat_answers_history" not in st.session_state:
     st.session_state["chat_answers_history"] = []
 if "show_all_sources" not in st.session_state:
     st.session_state["show_all_sources"] = False
-
 
 # ------------------- Helper Functions -------------------
 def get_profile_picture(email: str) -> Image.Image:
@@ -99,14 +96,13 @@ with st.sidebar:
     if st.session_state["user_prompt_history"]:
         export_data = export_chat_history()
         st.download_button(
-            label="📥 Download as JSON",
+            label="📅 Download as JSON",
             data=export_data,
             file_name="chat_history.json",
             mime="application/json"
         )
     else:
         st.info("No chat history yet.")
-
 
 # ------------------- Main UI -------------------
 st.markdown(
@@ -123,7 +119,6 @@ try:
         submit = st.button("Submit")
 except st.runtime.scriptrunner.script_run_context.StopException:
     st.stop()
-
 
 # ------------------- Process Prompt -------------------
 if 'prompt' in locals() and submit and prompt:
@@ -157,19 +152,17 @@ if 'prompt' in locals() and submit and prompt:
         except Exception as e:
             st.error(f"An error occurred while generating a response: {e}")
 
-
 # ------------------- Chat History -------------------
 if st.session_state["chat_answers_history"]:
     st.markdown("---")
-    for i in range(len(st.session_state["chat_answers_history"]) - 1, -1, -1):
+    for i in range(len(st.session_state["chat_answers_history"])-1, -1, -1):
         user_msg = st.session_state["user_prompt_history"][i]
         bot_msg = st.session_state["chat_answers_history"][i]
 
-        message(f"{user_msg['text']}  \n\n*{user_msg['timestamp']}*", is_user=True)
-        message(f"{bot_msg['answer']}  \n\n*{bot_msg['timestamp']}*")
+        message(f"{user_msg['text']}  \n\n*{user_msg['timestamp']}*", is_user=True, key=f"user_msg_{i}")
+        message(f"{bot_msg['answer']}  \n\n*{bot_msg['timestamp']}*", key=f"bot_msg_{i}")
 
         display_images(bot_msg.get("images", []))
-
 
 # ------------------- Footer -------------------
 st.markdown(
