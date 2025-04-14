@@ -121,31 +121,69 @@ def extract_feature_blocks(text: str):
                 logging.info(f"Extracted feature block for {label}")
     return features
 
+# New: Intelligent chunking (LateChunking) function inspired by the article
+def late_chunk_text(text: str, max_chunk_size: int = 1000, overlap_size: int = 200) -> List[str]:
+    """
+    Splits text into intelligent, overlapping chunks.
+    
+    The text is first split into sentences. Then sentences are grouped into
+    chunks that are at most max_chunk_size characters long. The last sentence of each
+    chunk is carried over as context (overlap) into the next chunk.
+    
+    Parameters:
+        text: The full text to chunk.
+        max_chunk_size: Maximum number of characters per chunk.
+        overlap_size: Not used directly here; the overlap is implemented as the last sentence.
+                      (This parameter can be adapted if a more fine-grained control of overlap is desired.)
+    Returns:
+        List of text chunks.
+    """
+    # Split text into sentences using punctuation as delimiters.
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    for sentence in sentences:
+        sentence_len = len(sentence)
+        # If adding this sentence would exceed the desired chunk length and we have some content already:
+        if current_length + sentence_len > max_chunk_size and current_chunk:
+            chunk = " ".join(current_chunk).strip()
+            chunks.append(chunk)
+            # Start new chunk with the last sentence of the previous chunk as an overlap for context.
+            current_chunk = [current_chunk[-1]]
+            current_length = len(current_chunk[0])
+        current_chunk.append(sentence)
+        current_length += sentence_len + 1  # Adding 1 for the space
+    if current_chunk:
+        chunks.append(" ".join(current_chunk).strip())
+    return chunks
+
+def extract_ft_price_table_with_finishes(text: str) -> str:
+    import pandas as pd
+    base_pattern = re.compile(r"(FT\d{3})[.\s]+(\d{2})\s+(\d{2})\s*((?:[A-Z] \$?\d{2,4}(?:\.\d{2})?\s*)+)")
+    finish_blocks = re.findall(r"(?i)(Metallic Paint.*?)\n(?:\s*\n|\Z)", text, re.DOTALL)
+    rows = []
+    for match in base_pattern.findall(text):
+        part, height, width, price_block = match
+        base_prices = dict(re.findall(r"([A-Z]) \$?(\d{2,4}(?:\.\d{2})?)", price_block))
+        for opt, base in base_prices.items():
+            rows.append([part, opt, "Standard", height, width, f"${float(base):.2f}"])
+        for finish_block in finish_blocks:
+            lines = finish_block.splitlines()
+            for line in lines:
+                finish_info = re.findall(r"([A-Z]{2,3})\s+\+?\$?(\d+)", line)
+                for finish_code, upcharge in finish_info:
+                    for opt, base in base_prices.items():
+                        final_price = float(base) + float(upcharge)
+                        rows.append([part, opt, finish_code, height, width, f"${final_price:.2f}"])
+    if not rows:
+        return ""
+    df = pd.DataFrame(rows, columns=["Part", "Option", "Finish", "Height", "Width", "Price"])
+    raw_finish_block = "\n".join(finish_blocks)
+    return df.to_markdown(index=False) + "\n\nFinish Modifier Info:\n" + raw_finish_block
+
 def extract_chunks_with_smart_grouping(pdf_path):
     import pandas as pd
-    def extract_ft_price_table_with_finishes(text: str) -> str:
-        base_pattern = re.compile(r"(FT\d{3})[.\s]+(\d{2})\s+(\d{2})\s*((?:[A-Z] \$?\d{2,4}(?:\.\d{2})?\s*)+)")
-        finish_blocks = re.findall(r"(?i)(Metallic Paint.*?)\n(?:\s*\n|\Z)", text, re.DOTALL)
-        rows = []
-        for match in base_pattern.findall(text):
-            part, height, width, price_block = match
-            base_prices = dict(re.findall(r"([A-Z]) \$?(\d{2,4}(?:\.\d{2})?)", price_block))
-            for opt, base in base_prices.items():
-                rows.append([part, opt, "Standard", height, width, f"${float(base):.2f}"])
-            for finish_block in finish_blocks:
-                lines = finish_block.splitlines()
-                for line in lines:
-                    finish_info = re.findall(r"([A-Z]{2,3})\s+\+?\$?(\d+)", line)
-                    for finish_code, upcharge in finish_info:
-                        for opt, base in base_prices.items():
-                            final_price = float(base) + float(upcharge)
-                            rows.append([part, opt, finish_code, height, width, f"${final_price:.2f}"])
-        if not rows:
-            return ""
-        df = pd.DataFrame(rows, columns=["Part", "Option", "Finish", "Height", "Width", "Price"])
-        raw_finish_block = "\n".join(finish_blocks)
-        return df.to_markdown(index=False) + "\n\nFinish Modifier Info:\n" + raw_finish_block
-
     logging.info(f"Processing file: {pdf_path}")
     doc = fitz.open(pdf_path)
     image_metadata = extract_images_and_illustrations(doc)
@@ -161,6 +199,7 @@ def extract_chunks_with_smart_grouping(pdf_path):
             if img["page"] == i + 1:
                 image_part_map[img["path"]] = found_parts
         if found_parts:
+            # Buffer text associated with found part numbers for later grouping
             for part in found_parts:
                 part_lower = part.lower()
                 if part_lower not in part_buffer:
@@ -168,9 +207,21 @@ def extract_chunks_with_smart_grouping(pdf_path):
                 part_buffer[part_lower]["pages"].append(i + 1)
                 part_buffer[part_lower]["text"].append(text)
         else:
-            chunks.extend(extract_feature_blocks(text))
-            meta = {"page": i + 1, "source": pdf_path}
-            chunks.append(Document(page_content=text, metadata=meta))
+            # For pages without specific part numbers, first extract any feature blocks
+            feature_docs = extract_feature_blocks(text)
+            if feature_docs:
+                chunks.extend(feature_docs)
+            else:
+                # Apply intelligent chunking if the page text is lengthy
+                if len(text) > 1000:
+                    subchunks = late_chunk_text(text, max_chunk_size=1000, overlap_size=200)
+                    for subchunk in subchunks:
+                        meta = {"page": i + 1, "source": pdf_path}
+                        chunks.append(Document(page_content=subchunk, metadata=meta))
+                else:
+                    meta = {"page": i + 1, "source": pdf_path}
+                    chunks.append(Document(page_content=text, metadata=meta))
+    # Process collected parts with merged text; use smart chunking if necessary
     for part, data in part_buffer.items():
         merged_text = "\n".join(data["text"])
         markdown = extract_ft_price_table_with_finishes(merged_text) or extract_pricing_table_as_markdown(merged_text)
@@ -181,8 +232,18 @@ def extract_chunks_with_smart_grouping(pdf_path):
             "source": pdf_path,
             "is_pricing_table": True
         }
-        chunks.append(Document(page_content=markdown or merged_text, metadata=meta))
-        logging.info(f"Added pricing chunk for {part} with pages {data['pages']}")
+        if markdown:
+            # If structured markdown is extracted, we use it as a whole chunk.
+            chunks.append(Document(page_content=markdown, metadata=meta))
+        else:
+            # Otherwise, if the merged text is very long, apply late chunking.
+            if len(merged_text) > 1000:
+                subchunks = late_chunk_text(merged_text, max_chunk_size=1000, overlap_size=200)
+                for subchunk in subchunks:
+                    chunks.append(Document(page_content=subchunk, metadata=meta))
+            else:
+                chunks.append(Document(page_content=merged_text, metadata=meta))
+    # Link images with their related parts into individual documents
     for img in image_metadata:
         related_parts = image_part_map.get(img["path"], [])
         chunks.append(Document(
