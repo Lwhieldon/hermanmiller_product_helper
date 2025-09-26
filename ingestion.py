@@ -138,8 +138,18 @@ def late_chunk_text(text: str, max_chunk_size: int = 1000, overlap_size: int = 2
     Returns:
         List of text chunks.
     """
+    # Handle empty or whitespace-only text
+    if not text or not text.strip():
+        return []
+    
     # Split text into sentences using punctuation as delimiters.
     sentences = re.split(r'(?<=[.!?])\s+', text)
+    # Filter out empty sentences
+    sentences = [s.strip() for s in sentences if s.strip()]
+    
+    if not sentences:
+        return []
+    
     chunks = []
     current_chunk = []
     current_length = 0
@@ -148,14 +158,19 @@ def late_chunk_text(text: str, max_chunk_size: int = 1000, overlap_size: int = 2
         # If adding this sentence would exceed the desired chunk length and we have some content already:
         if current_length + sentence_len > max_chunk_size and current_chunk:
             chunk = " ".join(current_chunk).strip()
-            chunks.append(chunk)
+            if chunk:  # Only add non-empty chunks
+                chunks.append(chunk)
             # Start new chunk with the last sentence of the previous chunk as an overlap for context.
-            current_chunk = [current_chunk[-1]]
-            current_length = len(current_chunk[0])
+            current_chunk = [current_chunk[-1]] if current_chunk else []
+            current_length = len(current_chunk[0]) if current_chunk else 0
         current_chunk.append(sentence)
         current_length += sentence_len + 1  # Adding 1 for the space
+    
     if current_chunk:
-        chunks.append(" ".join(current_chunk).strip())
+        chunk = " ".join(current_chunk).strip()
+        if chunk:  # Only add non-empty chunks
+            chunks.append(chunk)
+    
     return chunks
 
 def extract_ft_price_table_with_finishes(text: str) -> str:
